@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -22,13 +23,17 @@ import textwrap
 import threading
 import time
 
-APP = "scriptdeck"
-ROOT = pathlib.Path(os.environ.get("SCRIPTDECK_HOME", pathlib.Path.home() / ".local/share" / APP))
+APP = "sudodeck"
+DEFAULT_ROOT = pathlib.Path.home() / ".local/share" / APP
+DEFAULT_CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / APP / "config.json"
+LEGACY_ROOT = pathlib.Path.home() / ".local/share/scriptdeck"
+LEGACY_CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "scriptdeck" / "config.json"
+ROOT = pathlib.Path(os.environ.get("SUDODECK_HOME", os.environ.get("SCRIPTDECK_HOME", pathlib.Path.home() / ".local/share" / APP)))
 PAYLOADS = ROOT / "payloads"
 META = ROOT / "metadata"
 RUNS = ROOT / "runs"
 LOCK = ROOT / ".lock"
-CONFIG = pathlib.Path(os.environ.get("SCRIPTDECK_CONFIG", pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / APP / "config.json"))
+CONFIG = pathlib.Path(os.environ.get("SUDODECK_CONFIG", os.environ.get("SCRIPTDECK_CONFIG", DEFAULT_CONFIG)))
 BACKENDS = {"codex", "pi", "claude", "opencode"}
 
 
@@ -51,9 +56,9 @@ def checked_config() -> dict:
     try:
         value = json.loads(CONFIG.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise QueueError(f"invalid ScriptDeck config: {CONFIG}") from exc
+        raise QueueError(f"invalid SudoDeck config: {CONFIG}") from exc
     if not isinstance(value, dict):
-        raise QueueError(f"invalid ScriptDeck config: {CONFIG}")
+        raise QueueError(f"invalid SudoDeck config: {CONFIG}")
     return value
 
 
@@ -75,9 +80,9 @@ def qa_settings() -> tuple[str, str | None, int]:
     config = checked_config().get("qa", {})
     if not isinstance(config, dict):
         raise QueueError("invalid qa config")
-    return validate_qa_settings(os.environ.get("SCRIPTDECK_QA_BACKEND", config.get("backend", "codex")),
-                                os.environ.get("SCRIPTDECK_QA_MODEL", config.get("model")),
-                                os.environ.get("SCRIPTDECK_QA_TIMEOUT_SECONDS", config.get("timeout_seconds", 120)))
+    return validate_qa_settings(os.environ.get("SUDODECK_QA_BACKEND", os.environ.get("SCRIPTDECK_QA_BACKEND", config.get("backend", "codex"))),
+                                os.environ.get("SUDODECK_QA_MODEL", os.environ.get("SCRIPTDECK_QA_MODEL", config.get("model"))),
+                                os.environ.get("SUDODECK_QA_TIMEOUT_SECONDS", os.environ.get("SCRIPTDECK_QA_TIMEOUT_SECONDS", config.get("timeout_seconds", 120))))
 
 
 def save_qa_setting(key: str, value: object) -> None:
@@ -192,7 +197,8 @@ def latest_execution(item: dict) -> dict | None:
 
 def is_completed(item: dict) -> bool:
     record = latest_execution(item)
-    return bool(record and record.get("status") != "running")
+    # A successful old run does not complete a subsequently edited payload.
+    return bool(record and record.get("status") != "running" and record.get("sha256") == item.get("sha256"))
 
 
 def execution_label(item: dict) -> str:
@@ -202,6 +208,8 @@ def execution_label(item: dict) -> str:
     status = record["status"].upper()
     code = record.get("exit_code")
     suffix = f", exit {code}" if code is not None else ""
+    if record.get("sha256") != item.get("sha256"):
+        return f"PENDING REVISION (last {status}{suffix})"
     return f"{status}{suffix}"
 
 
@@ -273,6 +281,54 @@ def show(item: dict, show_hash: bool = False) -> None:
     print(payload.read_text(encoding="utf-8", errors="replace"), end="")
 
 
+def edit_review(item: dict) -> None:
+    """Edit a private copy and atomically promote it only if the queued bytes stay current."""
+    payload = verify(item)
+    original_hash = item["sha256"]
+    editor_text = os.environ.get("EDITOR") or ("vi" if shutil.which("vi") else "nano" if shutil.which("nano") else "")
+    if not editor_text:
+        print("No editor available; set EDITOR to an editor command (for example: code --wait).", file=sys.stderr)
+        return
+    try:
+        editor = shlex.split(editor_text)
+    except ValueError as exc:
+        print(f"Invalid EDITOR setting: {exc}", file=sys.stderr)
+        return
+    if not editor:
+        print("Invalid EDITOR setting.", file=sys.stderr)
+        return
+    fd, temporary_name = tempfile.mkstemp(prefix=f".edit-{item['id']}-", suffix=".sh", dir=PAYLOADS)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle, payload.open("rb") as source:
+            shutil.copyfileobj(source, handle)
+        os.chmod(temporary, 0o600)
+        completed = subprocess.run([*editor, str(temporary)], stdin=subprocess.DEVNULL)
+        if completed.returncode:
+            print(f"Editor exited {completed.returncode}; recoverable draft retained at {temporary}", file=sys.stderr)
+            return
+        checked_file(temporary)
+        revised_hash = sha256(temporary)
+        if revised_hash == original_hash:
+            temporary.unlink(missing_ok=True)
+            print("No queued changes saved.")
+            return
+        if sha256(checked_file(payload)) != original_hash or load(item["id"])["sha256"] != original_hash:
+            print(f"Queue changed concurrently; recoverable draft retained at {temporary}", file=sys.stderr)
+            return
+        revisions = item.setdefault("revisions", [])
+        if not isinstance(revisions, list):
+            raise QueueError("invalid revisions metadata")
+        os.chmod(temporary, 0o700)
+        os.replace(temporary, payload)
+        item["sha256"] = revised_hash
+        revisions.append({"sha256": revised_hash, "edited_at": now()})
+        atomic_json(metadata_path(item["id"]), item)
+        print("Saved a new queued revision. Review or Q&A now uses the edited bytes; nothing was executed.")
+    except (OSError, QueueError) as exc:
+        print(f"Edit was not saved ({exc}); recoverable draft retained at {temporary}", file=sys.stderr)
+
+
 def qa_prompt(payload: pathlib.Path, question: str) -> str:
     return textwrap.dedent(f"""\
         You are reviewing one queued shell script. Answer the question using only
@@ -321,7 +377,34 @@ def adapter_command(backend: str, model: str | None) -> list[str]:
         if model:
             command.extend(["--model", model])
         return command
-    raise AdapterUnavailable("OpenCode does not provide a verified noninteractive no-tools/no-MCP isolation mode")
+    command = [executable, "run", "--standalone", "--format", "json"]
+    if model:
+        command.extend(["--model", model])
+    return command
+
+
+def adapter_environment(backend: str) -> dict[str, str] | None:
+    if backend != "opencode":
+        return None
+    executable = shutil.which("opencode")
+    if not executable:
+        raise AdapterUnavailable("opencode CLI is unavailable")
+    inventory = subprocess.run([executable, "mcp", "list"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=True)
+    if inventory.stdout.strip() != "No MCP servers configured":
+        raise AdapterUnavailable("OpenCode has configured MCP servers; ScriptDeck cannot verify a per-process disable-all override")
+    environment = dict(os.environ)
+    environment.update({
+        "OPENCODE_PURE": "1",
+        "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
+        "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+        "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_CONFIG_CONTENT": json.dumps({"permission": {"*": "deny"}, "plugin": [], "mcp": {},
+                                                 "skills": {"paths": [], "urls": []}, "instructions": [],
+                                                 "formatter": False, "lsp": False}),
+    })
+    return environment
 
 
 def ask(item: dict) -> None:
@@ -337,8 +420,9 @@ def ask(item: dict) -> None:
         return
     try:
         command = adapter_command(backend, model)
+        environment = adapter_environment(backend)
         completed = subprocess.run([*command, qa_prompt(payload, question)], stdin=subprocess.DEVNULL,
-                                   cwd=PAYLOADS, text=True, timeout=timeout)
+                                   cwd=PAYLOADS, text=True, timeout=timeout, env=environment)
         if completed.returncode:
             print(f"{backend} Q&A exited {completed.returncode}; queue unchanged.", file=sys.stderr)
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError, QueueError) as exc:
@@ -434,8 +518,8 @@ def review(show_hash: bool = False, include_ran: bool = False) -> int:
             print("\n" + "=" * 72)
             print(describe(item, show_hash) + f"\nState: {execution_label(item)}")
             while True:
-                action = input("[v]iew [a]sk Codex [r]erun [s]kip [q]uit: " if is_completed(item) else "[v]iew [a]sk Codex [r]un [s]kip [q]uit: ").strip().lower()
-                if action == "v": show(item, show_hash)
+                action = input("[e]dit/review [a]sk Q&A [r]erun [s]kip [q]uit: " if is_completed(item) else "[e]dit/review [a]sk Q&A [r]un [s]kip [q]uit: ").strip().lower()
+                if action == "e": edit_review(item)
                 elif action == "a": ask(item)
                 elif action == "r":
                     if latest_execution(item) and latest_execution(item).get("status") == "running":
@@ -479,7 +563,7 @@ def config_show(_: argparse.Namespace) -> int:
     backend, model, timeout = qa_settings()
     print(json.dumps({"qa": {"backend": backend, "model": model, "timeout_seconds": timeout},
                       "config_path": str(CONFIG),
-                      "precedence": "SCRIPTDECK_QA_* environment variables override config values"}, indent=2))
+                      "precedence": "SUDODECK_QA_* then deprecated SCRIPTDECK_QA_* environment variables override config values"}, indent=2))
     return 0
 
 
@@ -501,8 +585,53 @@ def config_set_timeout(args: argparse.Namespace) -> int:
     return 0
 
 
+def migrate(_: argparse.Namespace) -> int:
+    """Move only the previous public ScriptDeck paths, without merging state."""
+    if any(name in os.environ for name in ("SUDODECK_HOME", "SCRIPTDECK_HOME", "SUDODECK_CONFIG", "SCRIPTDECK_CONFIG")):
+        raise QueueError("migrate requires default paths; unset queue/config override environment variables first")
+    state_exists = LEGACY_ROOT.exists()
+    config_exists = LEGACY_CONFIG.exists()
+    if not state_exists and not config_exists:
+        print("No legacy ScriptDeck state or config found; nothing migrated.")
+        return 0
+    if DEFAULT_ROOT.exists() or DEFAULT_CONFIG.exists():
+        raise QueueError("refusing migration because a SudoDeck state directory or config already exists; nothing was changed")
+    # Lock the old queue before checking and moving it, so an old alias cannot be
+    # in the middle of an edit/run while its private tree is renamed.
+    handle = None
+    try:
+        if state_exists:
+            import fcntl
+            legacy_lock = LEGACY_ROOT / ".lock"
+            if legacy_lock.is_symlink():
+                raise QueueError("unsafe legacy queue lock")
+            handle = legacy_lock.open("a+")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if LEGACY_ROOT.is_symlink() or not LEGACY_ROOT.is_dir():
+                raise QueueError("unsafe legacy queue directory")
+        if config_exists:
+            checked_file(LEGACY_CONFIG)
+        if config_exists:
+            private_dir(DEFAULT_CONFIG.parent)
+            os.replace(LEGACY_CONFIG, DEFAULT_CONFIG)
+            try:
+                LEGACY_CONFIG.parent.rmdir()
+            except OSError:
+                pass
+        if state_exists:
+            DEFAULT_ROOT.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(LEGACY_ROOT, DEFAULT_ROOT)
+        print(f"Migrated legacy ScriptDeck data to {DEFAULT_ROOT} and config to {DEFAULT_CONFIG}. Existing records were moved, not merged.")
+        return 0
+    except BlockingIOError as exc:
+        raise QueueError("legacy ScriptDeck queue is busy; close other review/run sessions and retry") from exc
+    finally:
+        if handle is not None:
+            handle.close()
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(prog=os.environ.get("SCRIPTDECK_PROG"), description=__doc__)
+    parser = argparse.ArgumentParser(prog=os.environ.get("SUDODECK_PROG", os.environ.get("SCRIPTDECK_PROG")), description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="copy a script into the queue and record its review notes")
     add.add_argument("path"); add.add_argument("--sha256", help="optional expected source digest"); add.add_argument("--title", required=True); add.add_argument("--summary", required=True); add.add_argument("--affects", required=True); add.add_argument("--risks", required=True); add.add_argument("--arg", action="append", default=[], help="literal argument passed when explicitly run"); add.set_defaults(func=enqueue)
@@ -524,6 +653,7 @@ def main() -> int:
     model_parser.add_argument("model"); model_parser.set_defaults(func=config_set_model)
     timeout_parser = config_commands.add_parser("set-qa-timeout", help="save a Q&A timeout in seconds")
     timeout_parser.add_argument("seconds", type=int); timeout_parser.set_defaults(func=config_set_timeout)
+    commands.add_parser("migrate", help="explicitly move legacy ScriptDeck default-path state into SudoDeck; never merges or overwrites").set_defaults(func=migrate)
     args = parser.parse_args()
     try: return args.func(args)
     except QueueError as exc: print(f"error: {exc}", file=sys.stderr); return 2
