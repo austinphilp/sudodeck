@@ -43,7 +43,7 @@ Claude Code and other agents are supported through the bundled portable skill; t
 
 ## Agent skill
 
-The portable skill is [`skills/scriptdeck/SKILL.md`](skills/scriptdeck/SKILL.md). For Codex, copy its directory to `~/.codex/skills/scriptdeck/` or `.codex/skills/scriptdeck/`. For Claude Code, copy it to `~/.claude/skills/scriptdeck/` or `.claude/skills/scriptdeck/`. These locations are documented by [OpenAI](https://developers.openai.com/codex/skills) and [Anthropic](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview).
+The portable skill is [`skills/scriptdeck/SKILL.md`](skills/scriptdeck/SKILL.md). For Codex, copy its directory to `~/.agents/skills/scriptdeck/` or a repository's `.agents/skills/scriptdeck/`. For Claude Code, copy it to `~/.claude/skills/scriptdeck/` or `.claude/skills/scriptdeck/`. These locations are documented by [OpenAI](https://developers.openai.com/codex/skills) and [Anthropic](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview).
 
 ## Development
 
