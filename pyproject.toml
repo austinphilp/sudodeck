@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sudodeck"
+version = "1.0.0"
+description = "Private, reviewed queue for privileged/admin shell scripts — explicit execution approval, scoped-sudo workflow."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Austin Philp"}]
+keywords = ["sudo", "review", "queue", "privilege", "admin", "scripts", "security"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+# Both `pip install .` and the bundled install-sudodeck.sh provide a `sudodeck`
+# command; the script installer remains the canonical (no-Python-path) install.
+[project.scripts]
+sudodeck = "sudodeck:main"
+
+[tool.setuptools]
+py-modules = ["sudodeck"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff.lint]
+select = ["F", "E9"]

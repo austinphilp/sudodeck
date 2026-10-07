@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import secrets
 import shlex
 import shutil
@@ -22,7 +23,6 @@ import sys
 import tempfile
 import textwrap
 import threading
-import time
 
 APP = "sudodeck"
 DEFAULT_ROOT = pathlib.Path.home() / ".local/share" / APP
@@ -212,6 +212,23 @@ def execution_label(item: dict) -> str:
     if record.get("sha256") != item.get("sha256"):
         return f"PENDING REVISION (last {status}{suffix})"
     return f"{status}{suffix}"
+
+
+def status_fields(item: dict) -> dict:
+    """Stable, machine-readable status for --json output, with stable keys.
+
+    `state` is one of PENDING, SUCCEEDED, FAILED, RUNNING, INTERRUPTED,
+    REJECTED or PENDING_REVISION; `exit_code` is a number or None. Scripts and
+    tooling can rely on these keys instead of parsing the human label."""
+    record = latest_execution(item)
+    if not record:
+        return {"state": "PENDING", "exit_code": None}
+    state = str(record.get("status", "")).upper()
+    exit_code = record.get("exit_code")
+    if record.get("sha256") != item.get("sha256"):
+        return {"state": "PENDING_REVISION", "exit_code": exit_code,
+                "last_status": state}
+    return {"state": state, "exit_code": exit_code}
 
 
 def verify(item: dict) -> pathlib.Path:
@@ -548,12 +565,24 @@ def review(show_hash: bool = False, include_ran: bool = False) -> int:
                         run(item); break
                 elif action == "s": break
                 elif action == "q": return 0
-                else: print("Choose v, a, r, s, or q.")
+                else: print("Choose e, a, r, s, or q.")
     return 0
 
 
 def list_items(args: argparse.Namespace) -> int:
     listed = [item for item in items() if args.include_ran or not is_completed(item)]
+    if args.json:
+        out = []
+        for item in listed:
+            title, summary, affects, risks = fields(item)
+            out.append({
+                "id": item["id"], "title": title, "summary": summary,
+                "affects": affects, "risks": risks, "sha256": item["sha256"],
+                "arguments": item.get("arguments", []), "created_at": item.get("created_at"),
+                "source": item.get("source"), "revisions": len(item.get("revisions") or []),
+                "status": status_fields(item)})
+        print(json.dumps({"items": out}, indent=2))
+        return 0
     if not listed:
         print("No pending scripts. Use --include-ran to list execution history.")
         return 0
@@ -565,14 +594,28 @@ def list_items(args: argparse.Namespace) -> int:
 
 
 def results(args: argparse.Namespace) -> int:
+    if args.id and not re.fullmatch(r"[a-z0-9-]{1,60}", args.id):
+        raise QueueError(f"invalid item id: {args.id}")
     base = RUNS / args.id if args.id else RUNS
     if not base.exists():
-        print("No results yet."); return 0
+        print(json.dumps({"runs": []}) if args.json else "No results yet.")
+        return 0
     records = sorted(base.glob("**/result.json"))
+    if args.json:
+        out = []
+        for path in records:
+            checked_file(path)
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise QueueError(f"invalid run record: {path}") from exc
+        print(json.dumps({"runs": out}, indent=2))
+        return 0
     if not records:
         print("No results yet.")
         return 0
     for path in records:
+        checked_file(path)
         print(path.read_text(encoding="utf-8"), end="")
     return 0
 
@@ -660,8 +703,11 @@ def main() -> int:
     list_parser = commands.add_parser("list", help="list queued scripts")
     list_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
     list_parser.add_argument("--include-ran", action="store_true", help="include completed items and their final statuses")
+    list_parser.add_argument("--json", action="store_true", help="emit the queue as machine-readable JSON (also exposes digests)")
     list_parser.set_defaults(func=list_items)
-    result = commands.add_parser("results", help="show saved run records"); result.add_argument("id", nargs="?"); result.set_defaults(func=results)
+    result = commands.add_parser("results", help="show saved run records")
+    result.add_argument("--json", action="store_true", help="emit run records as machine-readable JSON")
+    result.add_argument("id", nargs="?"); result.set_defaults(func=results)
     config_parser = commands.add_parser("config", help="show or save non-secret Q&A settings")
     config_commands = config_parser.add_subparsers(dest="config_command", required=True)
     config_commands.add_parser("show", help="show effective non-secret Q&A settings").set_defaults(func=config_show)
