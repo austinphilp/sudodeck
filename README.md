@@ -20,12 +20,17 @@ The installer places `scriptdeck` in `~/.local/bin` and data in `~/.local/share/
 ## Quick start
 
 ```sh
-sha256sum ./examples/hello.sh
-scriptdeck add ./examples/hello.sh --sha256 <paste-the-sha256> --description 'Prints a harmless greeting'
+scriptdeck add ./examples/hello.sh \
+  --title 'Greeting example' \
+  --summary 'Prints a harmless greeting' \
+  --affects 'Terminal output only' \
+  --risks 'None beyond printing text'
 scriptdeck review
 ```
 
-`review` offers view, optional Codex question, explicit run, skip, and quit. Use `scriptdeck list` to inspect items and `scriptdeck results [ID]` to read machine-readable run records. Store literal execution arguments with `--arg=VALUE`.
+Each item requires `Title`, `Summary`, `Affects`, and `Risks` notes. `review` offers view, optional Codex question, run, skip, and quit. Pressing `r` is the execution choice; there is no second confirmation prompt. Use `scriptdeck list` to inspect items and `scriptdeck results [ID]` to read machine-readable run records. Store literal execution arguments with `--arg=VALUE`.
+
+ScriptDeck always calculates and stores a SHA-256 digest internally for tamper checks. You do not need to supply one. Pass `--sha256 DIGEST` only when you want `add` to reject a source file that does not match a separately reviewed digest. Hashes are hidden in the normal human UI; use `scriptdeck list --show-sha256` or `scriptdeck review --show-sha256` to display them.
 
 ## Safety model and limits
 

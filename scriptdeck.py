@@ -138,10 +138,9 @@ def enqueue(args: argparse.Namespace) -> int:
     checked_file(source)
     if source.stat().st_size > 5 * 1024 * 1024:
         raise QueueError("refusing payload larger than 5 MiB")
-    expected = args.sha256.lower()
     actual = sha256(source)
-    if actual != expected:
-        raise QueueError(f"source hash mismatch; expected {expected}, got {actual}")
+    if args.sha256 and actual != args.sha256.lower():
+        raise QueueError(f"source hash mismatch; expected {args.sha256.lower()}, got {actual}")
     with lock():
         item_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(3)
         target = payload_path(item_id)
@@ -150,16 +149,34 @@ def enqueue(args: argparse.Namespace) -> int:
         if sha256(target) != actual:
             target.unlink(missing_ok=True)
             raise QueueError("copy verification failed")
-        record = {"id": item_id, "created_at": now(), "description": args.description,
+        record = {"id": item_id, "created_at": now(), "title": args.title,
+                  "summary": args.summary, "affects": args.affects, "risks": args.risks,
                   "source": str(source), "sha256": actual, "kind": "shell", "arguments": args.arg, "runs": []}
         atomic_json(metadata_path(item_id), record)
     print(item_id)
     return 0
 
 
-def show(item: dict) -> None:
+def fields(item: dict) -> tuple[str, str, str, str]:
+    legacy = item.get("description")
+    title = item.get("title") or legacy or "Untitled legacy item"
+    summary = item.get("summary") or (legacy if legacy else "Not recorded (legacy item).")
+    affects = item.get("affects") or "Not recorded (legacy item)."
+    risks = item.get("risks") or "Not recorded (legacy item)."
+    return title, summary, affects, risks
+
+
+def describe(item: dict, show_hash: bool = False) -> str:
+    title, summary, affects, risks = fields(item)
+    details = f"ID: {item['id']}\nAdded: {item['created_at']}\nTitle: {title}\nSummary: {summary}\nAffects: {affects}\nRisks: {risks}\nArguments: {item.get('arguments', [])}"
+    if show_hash:
+        details += f"\nSHA256: {item['sha256']}"
+    return details
+
+
+def show(item: dict, show_hash: bool = False) -> None:
     payload = verify(item)
-    print(f"ID: {item['id']}\nAdded: {item['created_at']}\nSHA256: {item['sha256']}\nArguments: {item.get('arguments', [])}\nDescription: {item['description']}\n")
+    print(describe(item, show_hash) + "\n")
     print(payload.read_text(encoding="utf-8", errors="replace"), end="")
 
 
@@ -240,11 +257,8 @@ def safe_terminal_write(terminal, chunk: bytes) -> None:
 
 
 def run(item: dict) -> None:
-    payload = verify(item)
-    print(f"About to run {item['id']} with verified hash {item['sha256']}.")
-    if input("Type RUN to execute, anything else to cancel: ") != "RUN":
-        print("Not run.")
-        return
+    verify(item)
+    print(f"Executing reviewed item: {fields(item)[0]}")
     # The snapshot is created only after approval and is the only file executed.
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
     run_dir = RUNS / item["id"] / run_id
@@ -289,7 +303,7 @@ def run(item: dict) -> None:
     print(f"{record['status']} (exit {record['exit_code']}); stdout/stderr saved in {run_dir}")
 
 
-def review() -> int:
+def review(show_hash: bool = False) -> int:
     with lock():
         queued = items()
         if not queued:
@@ -297,10 +311,10 @@ def review() -> int:
             return 0
         for item in queued:
             print("\n" + "=" * 72)
-            print(f"{item['id']}: {item['description']}\nSHA256: {item['sha256']}")
+            print(describe(item, show_hash))
             while True:
                 action = input("[v]iew [a]sk Codex [r]un [s]kip [q]uit: ").strip().lower()
-                if action == "v": show(item)
+                if action == "v": show(item, show_hash)
                 elif action == "a": ask(item)
                 elif action == "r": run(item); break
                 elif action == "s": break
@@ -309,9 +323,11 @@ def review() -> int:
     return 0
 
 
-def list_items(_: argparse.Namespace) -> int:
+def list_items(args: argparse.Namespace) -> int:
     for item in items():
-        print(f"{item['id']}  {item['sha256']}  {item['description']}")
+        title = fields(item)[0]
+        hash_part = f"  {item['sha256']}" if args.show_sha256 else ""
+        print(f"{item['id']}{hash_part}  {title}")
     return 0
 
 
@@ -331,10 +347,14 @@ def results(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    add = commands.add_parser("add", help="copy a hash-verified script into the queue")
-    add.add_argument("path"); add.add_argument("--sha256", required=True); add.add_argument("--description", required=True); add.add_argument("--arg", action="append", default=[], help="literal argument passed when explicitly run"); add.set_defaults(func=enqueue)
-    commands.add_parser("review", help="review queued scripts and explicitly run/skip them").set_defaults(func=lambda _: review())
-    commands.add_parser("list", help="list queued scripts").set_defaults(func=list_items)
+    add = commands.add_parser("add", help="copy a script into the queue and record its review notes")
+    add.add_argument("path"); add.add_argument("--sha256", help="optional expected source digest"); add.add_argument("--title", required=True); add.add_argument("--summary", required=True); add.add_argument("--affects", required=True); add.add_argument("--risks", required=True); add.add_argument("--arg", action="append", default=[], help="literal argument passed when explicitly run"); add.set_defaults(func=enqueue)
+    review_parser = commands.add_parser("review", help="review queued scripts and explicitly run/skip them")
+    review_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
+    review_parser.set_defaults(func=lambda args: review(args.show_sha256))
+    list_parser = commands.add_parser("list", help="list queued scripts")
+    list_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
+    list_parser.set_defaults(func=list_items)
     result = commands.add_parser("results", help="show saved run records"); result.add_argument("id", nargs="?"); result.set_defaults(func=results)
     args = parser.parse_args()
     try: return args.func(args)
