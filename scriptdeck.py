@@ -345,7 +345,7 @@ def results(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog=os.environ.get("SCRIPTDECK_PROG"), description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="copy a script into the queue and record its review notes")
     add.add_argument("path"); add.add_argument("--sha256", help="optional expected source digest"); add.add_argument("--title", required=True); add.add_argument("--summary", required=True); add.add_argument("--affects", required=True); add.add_argument("--risks", required=True); add.add_argument("--arg", action="append", default=[], help="literal argument passed when explicitly run"); add.set_defaults(func=enqueue)
