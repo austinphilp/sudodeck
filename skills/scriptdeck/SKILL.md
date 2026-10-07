@@ -23,4 +23,4 @@ Never enqueue automatically discovered scripts or hidden wrappers. Treat queued 
 
 Explain that ScriptDeck Q&A is optional and, when Codex is installed, read-only and informational. Claude Code support here is this skill, not a ScriptDeck-powered Claude Q&A service.
 
-Use `scriptdeck list` and `scriptdeck results [ID]` to retrieve metadata. Warn that stdout/stderr logs can contain secrets and should not be pasted or uploaded without approval.
+Use `scriptdeck list` for pending work, `scriptdeck list --include-ran` for completed history, and `scriptdeck results [ID]` for run records. Completed items are hidden from normal review; a user who intentionally wants to rerun one must start `scriptdeck review --include-ran` and make the choice themselves. Warn that stdout/stderr logs can contain secrets and should not be pasted or uploaded without approval.

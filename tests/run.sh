@@ -31,20 +31,40 @@ grep -q '"status": "succeeded"' "$result"
 grep -q hello-test "$(dirname "$result")/stdout.log"
 grep -q stderr-test "$(dirname "$result")/stderr.log"
 test "$(sha256sum "$(dirname "$result")/payload.sh" | awk '{print $1}')" = "$hash"
+python3 "$root/scriptdeck.py" list > "$work/post-run-list.out"
+if grep -q 'Harmless fixture' "$work/post-run-list.out"; then exit 1; fi
+python3 "$root/scriptdeck.py" list --include-ran > "$work/history-list.out"
+grep -q '\[SUCCEEDED, exit 0\].*Harmless fixture' "$work/history-list.out"
 
 legacy_id=legacy-item
 printf '#!/bin/sh\necho legacy\n' > "$SCRIPTDECK_HOME/payloads/$legacy_id.sh"
 chmod 700 "$SCRIPTDECK_HOME/payloads/$legacy_id.sh"
 printf '{"id":"legacy-item","created_at":"2000-01-01T00:00:00+00:00","description":"Legacy description","sha256":"%s","runs":[]}' "$(sha256sum "$SCRIPTDECK_HOME/payloads/$legacy_id.sh" | awk '{print $1}')" > "$SCRIPTDECK_HOME/metadata/$legacy_id.json"
 chmod 600 "$SCRIPTDECK_HOME/metadata/$legacy_id.json"
-printf 's\ns\n' | python3 "$root/scriptdeck.py" review > "$work/legacy.out"
+printf 's\n' | python3 "$root/scriptdeck.py" review > "$work/legacy.out"
 grep -q 'Title: Legacy description' "$work/legacy.out"
 grep -q 'Affects: Not recorded (legacy item).' "$work/legacy.out"
 grep -q 'Risks: Not recorded (legacy item).' "$work/legacy.out"
+python3 "$root/scriptdeck.py" list > "$work/legacy-pending.out"
+grep -q 'Legacy description' "$work/legacy-pending.out"
+
+printf '#!/bin/sh\nexit 7\n' > "$work/failure.sh"
+chmod 700 "$work/failure.sh"
+failure_id=$(python3 "$root/scriptdeck.py" add "$work/failure.sh" --title 'Failure fixture' --summary 'Exits 7' --affects 'Temporary test files' --risks 'Expected test failure')
+printf 's\nr\n' | python3 "$root/scriptdeck.py" review > "$work/failure.out" 2> "$work/failure.err"
+failure_result=$(find "$SCRIPTDECK_HOME/runs/$failure_id" -name result.json -print -quit)
+grep -q '"status": "failed"' "$failure_result"
+grep -q '"exit_code": 7' "$failure_result"
+python3 "$root/scriptdeck.py" list > "$work/pending-after-failure.out"
+if grep -q 'Failure fixture' "$work/pending-after-failure.out"; then exit 1; fi
+python3 "$root/scriptdeck.py" list --include-ran > "$work/history-after-failure.out"
+grep -q '\[FAILED, exit 7\].*Failure fixture' "$work/history-after-failure.out"
+printf 's\ns\ns\n' | python3 "$root/scriptdeck.py" review --include-ran > "$work/rerun-menu.out"
+grep -q '\[r\]erun' "$work/rerun-menu.out"
 
 printf '#!/bin/sh\necho changed\n' > "$SCRIPTDECK_HOME/payloads/$id.sh"
 chmod 700 "$SCRIPTDECK_HOME/payloads/$id.sh"
-if printf 's\nr\n' | python3 "$root/scriptdeck.py" review > /dev/null 2> "$work/tamper.err"; then exit 1; fi
+if printf 's\nr\n' | python3 "$root/scriptdeck.py" review --include-ran > /dev/null 2> "$work/tamper.err"; then exit 1; fi
 grep -q 'payload changed for' "$work/tamper.err"
 
 echo 'ScriptDeck tests passed'

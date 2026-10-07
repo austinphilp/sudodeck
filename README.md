@@ -28,7 +28,9 @@ scriptdeck add ./examples/hello.sh \
 scriptdeck review
 ```
 
-Each item requires `Title`, `Summary`, `Affects`, and `Risks` notes. `review` offers view, optional Codex question, run, skip, and quit. Pressing `r` is the execution choice; there is no second confirmation prompt. Use `scriptdeck list` to inspect items and `scriptdeck results [ID]` to read machine-readable run records. Store literal execution arguments with `--arg=VALUE`.
+Each item requires `Title`, `Summary`, `Affects`, and `Risks` notes. `review` offers view, optional Codex question, run, skip, and quit. Pressing `r` is the execution choice; there is no second confirmation prompt. Store literal execution arguments with `--arg=VALUE`.
+
+After an item has a durable run record—whether it succeeded, failed, was interrupted, or was rejected—it is hidden from the default pending queue. Its logs and result history remain available through `scriptdeck results [ID]`. Use `scriptdeck list --include-ran` to see completed items and their final statuses. A rerun is deliberate: start `scriptdeck review --include-ran`, then choose `r` for the completed item. An item whose durable record is still `running` remains visible and cannot be started again.
 
 ScriptDeck always calculates and stores a SHA-256 digest internally for tamper checks. You do not need to supply one. Pass `--sha256 DIGEST` only when you want `add` to reject a source file that does not match a separately reviewed digest. Hashes are hidden in the normal human UI; use `scriptdeck list --show-sha256` or `scriptdeck review --show-sha256` to display them.
 

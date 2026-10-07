@@ -112,6 +112,44 @@ def items() -> list[dict]:
     return sorted(result, key=lambda item: item["created_at"])
 
 
+def latest_execution(item: dict) -> dict | None:
+    """Return the newest durable result, falling back to metadata after a crash."""
+    records = []
+    run_root = RUNS / item["id"]
+    if run_root.is_dir() and not run_root.is_symlink():
+        for path in run_root.glob("*/result.json"):
+            try:
+                checked_file(path)
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(record, dict) and isinstance(record.get("status"), str):
+                    records.append(record)
+            except (OSError, json.JSONDecodeError, QueueError):
+                continue
+    if records:
+        return max(records, key=lambda record: record.get("started_at", ""))
+    runs = item.get("runs", [])
+    if isinstance(runs, list):
+        valid = [record for record in runs if isinstance(record, dict) and isinstance(record.get("status"), str)]
+        if valid:
+            return valid[-1]
+    return None
+
+
+def is_completed(item: dict) -> bool:
+    record = latest_execution(item)
+    return bool(record and record.get("status") != "running")
+
+
+def execution_label(item: dict) -> str:
+    record = latest_execution(item)
+    if not record:
+        return "PENDING"
+    status = record["status"].upper()
+    code = record.get("exit_code")
+    suffix = f", exit {code}" if code is not None else ""
+    return f"{status}{suffix}"
+
+
 def verify(item: dict) -> pathlib.Path:
     payload = checked_file(payload_path(item["id"]))
     actual = sha256(payload)
@@ -303,20 +341,26 @@ def run(item: dict) -> None:
     print(f"{record['status']} (exit {record['exit_code']}); stdout/stderr saved in {run_dir}")
 
 
-def review(show_hash: bool = False) -> int:
+def review(show_hash: bool = False, include_ran: bool = False) -> int:
     with lock():
-        queued = items()
+        queued = [item for item in items() if include_ran or not is_completed(item)]
         if not queued:
-            print("Queue is empty.")
+            print("No pending scripts. Use --include-ran to review completed history or deliberately rerun an item.")
             return 0
         for item in queued:
             print("\n" + "=" * 72)
-            print(describe(item, show_hash))
+            print(describe(item, show_hash) + f"\nState: {execution_label(item)}")
             while True:
-                action = input("[v]iew [a]sk Codex [r]un [s]kip [q]uit: ").strip().lower()
+                action = input("[v]iew [a]sk Codex [r]erun [s]kip [q]uit: " if is_completed(item) else "[v]iew [a]sk Codex [r]un [s]kip [q]uit: ").strip().lower()
                 if action == "v": show(item, show_hash)
                 elif action == "a": ask(item)
-                elif action == "r": run(item); break
+                elif action == "r":
+                    if latest_execution(item) and latest_execution(item).get("status") == "running":
+                        print("This item has a run in progress; inspect results before attempting another run.")
+                    elif is_completed(item) and not include_ran:
+                        print("Completed items require --include-ran for a deliberate rerun.")
+                    else:
+                        run(item); break
                 elif action == "s": break
                 elif action == "q": return 0
                 else: print("Choose v, a, r, s, or q.")
@@ -324,10 +368,14 @@ def review(show_hash: bool = False) -> int:
 
 
 def list_items(args: argparse.Namespace) -> int:
-    for item in items():
+    listed = [item for item in items() if args.include_ran or not is_completed(item)]
+    if not listed:
+        print("No pending scripts. Use --include-ran to list execution history.")
+        return 0
+    for item in listed:
         title = fields(item)[0]
         hash_part = f"  {item['sha256']}" if args.show_sha256 else ""
-        print(f"{item['id']}{hash_part}  {title}")
+        print(f"{item['id']}{hash_part}  [{execution_label(item)}]  {title}")
     return 0
 
 
@@ -351,9 +399,11 @@ def main() -> int:
     add.add_argument("path"); add.add_argument("--sha256", help="optional expected source digest"); add.add_argument("--title", required=True); add.add_argument("--summary", required=True); add.add_argument("--affects", required=True); add.add_argument("--risks", required=True); add.add_argument("--arg", action="append", default=[], help="literal argument passed when explicitly run"); add.set_defaults(func=enqueue)
     review_parser = commands.add_parser("review", help="review queued scripts and explicitly run/skip them")
     review_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
-    review_parser.set_defaults(func=lambda args: review(args.show_sha256))
+    review_parser.add_argument("--include-ran", action="store_true", help="include completed items for a deliberate rerun")
+    review_parser.set_defaults(func=lambda args: review(args.show_sha256, args.include_ran))
     list_parser = commands.add_parser("list", help="list queued scripts")
     list_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
+    list_parser.add_argument("--include-ran", action="store_true", help="include completed items and their final statuses")
     list_parser.set_defaults(func=list_items)
     result = commands.add_parser("results", help="show saved run records"); result.add_argument("id", nargs="?"); result.set_defaults(func=results)
     args = parser.parse_args()
