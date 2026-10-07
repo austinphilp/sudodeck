@@ -57,6 +57,33 @@ The bundled skill is [`.agents/skills/sudodeck/SKILL.md`](.agents/skills/sudodec
 ## Development
 
 ```sh
+# Existing smoke suite (CLI end-to-end + editor/Q&A harness checks)
 ./tests/run.sh
-python3 -m py_compile sudodeck.py
+
+# Full pytest suite (isolated queues, JSON outputs, ad-hoc + unit coverage)
+python3 -m pytest
 ```
+
+Quality gates: `python3 -m py_compile sudodeck.py` and `ruff` (`ruff check .`).
+SudoDeck uses no runtime dependencies; `pip install .` provides the same
+`sudodeck` command as `./install-sudodeck.sh` (which remains the canonical,
+Python-free install).
+
+## Machine-readable output
+
+For scripting and monitoring, the queue can be exported as JSON instead of
+parsed from the human text:
+
+```sh
+sudodeck list --json                 # pending items
+sudodeck list --json --include-ran   # pending + completed, with run state
+sudodeck results --json              # every saved run record
+sudodeck results <ID> --json         # run records for one item
+```
+
+`list --json` returns a stable schema per item (`id`, `title`, `summary`,
+`affects`, `risks`, `sha256`, `arguments`, `created_at`, `source`,
+`revisions`, and a `status` object with a stable `state` key and `exit_code`),
+so tooling does not parse the human label. `results --json` returns structured
+run records (`status`, `exit_code`, `stdout`/`stderr` log paths, `started_at`,
+`ended_at`) instead of raw concatenated files.
