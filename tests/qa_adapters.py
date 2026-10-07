@@ -2,9 +2,11 @@
 """Unit tests for Q&A settings precedence and safe adapter command shapes."""
 import json
 import os
+import pathlib
 import runpy
 import subprocess
 import tempfile
+import time
 
 
 with tempfile.TemporaryDirectory() as work:
@@ -53,5 +55,24 @@ with tempfile.TemporaryDirectory() as work:
     finally:
         module["shutil"].which = original_which
         module["subprocess"].run = original_run
+
+    # A timed-out harness may fork; both the launcher and its child must go.
+    module["setup"]()
+    child_pid = pathlib.Path(work) / "qa-child.pid"
+    command = ["/bin/sh", "-c", f"sleep 30 & echo $! > {child_pid}; wait"]
+    try:
+        module["run_qa_harness"](command, "ignored prompt", 1, None)
+        raise AssertionError("expected timeout")
+    except module["QueueError"] as exc:
+        assert "process group was terminated" in str(exc)
+    pid = int(child_pid.read_text())
+    for _ in range(20):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("timed-out harness child remained alive")
 
 print("Q&A adapter tests passed")

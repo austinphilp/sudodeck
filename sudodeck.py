@@ -15,6 +15,7 @@ import pathlib
 import secrets
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -407,6 +408,24 @@ def adapter_environment(backend: str) -> dict[str, str] | None:
     return environment
 
 
+def run_qa_harness(command: list[str], prompt: str, timeout: int, environment: dict[str, str] | None) -> int:
+    """Run one noninteractive harness and terminate its whole private group on timeout."""
+    process = subprocess.Popen([*command, prompt], stdin=subprocess.DEVNULL, cwd=PAYLOADS,
+                               text=True, env=environment, start_new_session=True)
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        except ProcessLookupError:
+            pass
+        raise QueueError(f"Q&A timed out after {timeout} seconds; its private process group was terminated") from exc
+
+
 def ask(item: dict) -> None:
     payload = verify(item)
     default_backend, model, timeout = qa_settings()
@@ -421,10 +440,9 @@ def ask(item: dict) -> None:
     try:
         command = adapter_command(backend, model)
         environment = adapter_environment(backend)
-        completed = subprocess.run([*command, qa_prompt(payload, question)], stdin=subprocess.DEVNULL,
-                                   cwd=PAYLOADS, text=True, timeout=timeout, env=environment)
-        if completed.returncode:
-            print(f"{backend} Q&A exited {completed.returncode}; queue unchanged.", file=sys.stderr)
+        returncode = run_qa_harness(command, qa_prompt(payload, question), timeout, environment)
+        if returncode:
+            print(f"{backend} Q&A exited {returncode}; queue unchanged.", file=sys.stderr)
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError, QueueError) as exc:
         print(f"{backend} Q&A unavailable ({exc}); queue unchanged.", file=sys.stderr)
 
