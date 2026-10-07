@@ -1,6 +1,6 @@
 # ScriptDeck
 
-ScriptDeck is a small, private queue for shell scripts that deserve a deliberate review before they run. It copies a hash-verified payload into a per-user directory, lets you inspect or ask about it, and requires an explicit `RUN` confirmation for every execution.
+ScriptDeck is a small, private queue for privileged/admin shell scripts that deserve a deliberate review before they run. It copies a hash-verified payload into a per-user directory, lets you inspect or ask about it, and requires an explicit user choice for every execution.
 
 It is a local CLI: it does not upload scripts or logs, create users, require root, or change security configuration.
 
@@ -40,13 +40,40 @@ ScriptDeck never runs a script on `add`. It copies requested bytes, records SHA-
 
 Run data lives under `~/.local/share/scriptdeck/runs/` in private directories. Output is not redacted and can contain secrets; do not upload or share logs blindly. Terminal control characters are made visible during live display, while raw output remains in the log.
 
-Scripts start with stdin disconnected. Normal interactive `sudo` can still prompt through `/dev/tty`; scripts that require passwords from stdin are incompatible by design. ScriptDeck does not provide a privileged runner, sudoers changes, or auto-approval. It protects against accidental changes and cooperating concurrent processes, not a malicious process running as the same Unix account.
+ScriptDeck itself stays unprivileged. Scripts request their own scoped interactive `sudo` through `/dev/tty`; scripts that require passwords from stdin are incompatible by design. ScriptDeck does not provide a privileged runner, sudoers changes, or auto-approval. It protects against accidental changes and cooperating concurrent processes, not a malicious process running as the same Unix account.
 
-## Codex Q&A
+## Q&A backends
 
-If the Codex CLI is available, ScriptDeck runs an ephemeral noninteractive Q&A session with the queued script and user question only. It uses a read-only sandbox, disables configured MCP servers and app/plugin/hook/browser/computer integrations, and never lets a response alter or execute queue contents. It still needs network access to Codex's model service. If isolation checks fail, normal review remains usable and Q&A reports the failure.
+At the `a` review action, choose a backend or press Enter for the saved default. Q&A receives only the queued bytes and your question; its output is display-only data and never selects `r`, adds a script, or changes queue state. Missing CLI/authentication and failed isolation checks leave normal review usable.
 
-Claude Code and other agents are supported through the bundled portable skill; they do **not** receive an automatic Q&A backend from ScriptDeck.
+| Backend | Status | Isolation used |
+| --- | --- | --- |
+| Codex CLI | Supported | Ephemeral read-only sandbox; every configured MCP server is disabled and verified disabled; apps, plugins, hooks, browser, and computer integrations are disabled. |
+| Pi coding agent | Supported on Pi 0.85+ | Noninteractive/no-session mode with all tools, extensions, skills, prompt templates, themes, and context files disabled. |
+| Claude Code | Supported on Claude Code 2.1+ | Print/no-session mode with safe mode, restricted mode, strict empty MCP configuration, no tools, no Chrome, and no permission prompts. |
+| OpenCode | Deliberately unavailable | OpenCode 2.0.3 exposes noninteractive mode but no verified no-tools/no-MCP isolation. ScriptDeck fails closed and does not start a session. |
+
+These adapters still need their harness's existing authentication and model-service network access. ScriptDeck never installs a harness, logs in, copies credentials, or accepts arbitrary harness flags.
+
+### Default and overrides
+
+Saved non-secret settings live in `~/.config/scriptdeck/config.json` (or `$SCRIPTDECK_CONFIG`):
+
+```sh
+scriptdeck config set-qa-backend pi
+scriptdeck config set-qa-model anthropic/claude-sonnet
+scriptdeck config set-qa-timeout 90
+scriptdeck config show
+```
+
+Environment variables take precedence over config, which takes precedence over built-in defaults:
+
+```sh
+SCRIPTDECK_QA_BACKEND=claude SCRIPTDECK_QA_MODEL=sonnet scriptdeck review
+SCRIPTDECK_QA_TIMEOUT_SECONDS=60 scriptdeck review
+```
+
+The built-in backend default is `codex`; the built-in timeout is 120 seconds. Do not put credentials in ScriptDeck config or environment examples.
 
 ## Agent skill
 

@@ -28,14 +28,69 @@ PAYLOADS = ROOT / "payloads"
 META = ROOT / "metadata"
 RUNS = ROOT / "runs"
 LOCK = ROOT / ".lock"
+CONFIG = pathlib.Path(os.environ.get("SCRIPTDECK_CONFIG", pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / APP / "config.json"))
+BACKENDS = {"codex", "pi", "claude", "opencode"}
 
 
 class QueueError(RuntimeError):
     pass
 
 
+class AdapterUnavailable(QueueError):
+    pass
+
+
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def checked_config() -> dict:
+    if not CONFIG.exists():
+        return {}
+    checked_file(CONFIG)
+    try:
+        value = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QueueError(f"invalid ScriptDeck config: {CONFIG}") from exc
+    if not isinstance(value, dict):
+        raise QueueError(f"invalid ScriptDeck config: {CONFIG}")
+    return value
+
+
+def validate_qa_settings(backend: object, model: object, raw_timeout: object) -> tuple[str, str | None, int]:
+    if not isinstance(backend, str) or backend not in BACKENDS:
+        raise QueueError(f"unsupported Q&A backend: {backend!r}")
+    if model is not None and (not isinstance(model, str) or not model.strip() or len(model) > 200 or "\x00" in model):
+        raise QueueError("invalid Q&A model setting")
+    try:
+        timeout = int(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise QueueError("invalid Q&A timeout setting") from exc
+    if not 1 <= timeout <= 300:
+        raise QueueError("Q&A timeout must be between 1 and 300 seconds")
+    return backend, model, timeout
+
+
+def qa_settings() -> tuple[str, str | None, int]:
+    config = checked_config().get("qa", {})
+    if not isinstance(config, dict):
+        raise QueueError("invalid qa config")
+    return validate_qa_settings(os.environ.get("SCRIPTDECK_QA_BACKEND", config.get("backend", "codex")),
+                                os.environ.get("SCRIPTDECK_QA_MODEL", config.get("model")),
+                                os.environ.get("SCRIPTDECK_QA_TIMEOUT_SECONDS", config.get("timeout_seconds", 120)))
+
+
+def save_qa_setting(key: str, value: object) -> None:
+    config = checked_config()
+    qa = config.setdefault("qa", {})
+    if not isinstance(qa, dict):
+        raise QueueError("invalid qa config")
+    candidate = dict(qa)
+    candidate[key] = value
+    validate_qa_settings(candidate.get("backend", "codex"), candidate.get("model"), candidate.get("timeout_seconds", 120))
+    qa[key] = value
+    private_dir(CONFIG.parent)
+    atomic_json(CONFIG, config)
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -218,48 +273,76 @@ def show(item: dict, show_hash: bool = False) -> None:
     print(payload.read_text(encoding="utf-8", errors="replace"), end="")
 
 
-def ask(item: dict) -> None:
-    payload = verify(item)
-    codex = shutil.which("codex")
-    if not codex:
-        print("Codex CLI is unavailable; use view, run, skip, or quit.", file=sys.stderr)
-        return
-    question = input("Question for Codex (blank cancels): ").strip()
-    if not question:
-        return
-    # The only context is the immutable queued payload and the user's question.
-    prompt = textwrap.dedent(f"""\
+def qa_prompt(payload: pathlib.Path, question: str) -> str:
+    return textwrap.dedent(f"""\
         You are reviewing one queued shell script. Answer the question using only
         the script below. Do not run commands, edit files, use tools, recommend
         bypassing review, or provide instructions that execute this script.
         State uncertainty plainly.\n\nQuestion: {question}\n\nScript:\n{payload.read_text(encoding='utf-8', errors='replace')}""")
+
+
+def codex_command(codex: str, model: str | None) -> list[str]:
+    listed = subprocess.run([codex, "mcp", "list", "--json"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=True)
+    servers = json.loads(listed.stdout)
+    if not isinstance(servers, list) or any(not isinstance(server, dict) or not isinstance(server.get("name"), str) or not server["name"].replace("-", "").replace("_", "").isalnum() for server in servers):
+        raise AdapterUnavailable("cannot safely disable configured Codex connectors")
+    disable_mcp = [part for server in servers for part in ("-c", f"mcp_servers.{server['name']}.enabled=false")]
+    effective = subprocess.run([codex, *disable_mcp, "mcp", "list", "--json"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=True)
+    effective_servers = json.loads(effective.stdout)
+    if not isinstance(effective_servers, list) or any(server.get("enabled") for server in effective_servers if isinstance(server, dict)):
+        raise AdapterUnavailable("configured Codex connectors remained enabled")
+    command = [codex, "exec", *disable_mcp, "--sandbox", "read-only", "--ephemeral",
+               "--ignore-rules", "--disable", "apps", "--disable", "plugins", "--disable", "hooks",
+               "--disable", "browser_use", "--disable", "computer_use", "--disable", "in_app_browser",
+               "--skip-git-repo-check"]
+    if model:
+        command.extend(["--model", model])
+    return command
+
+
+def adapter_command(backend: str, model: str | None) -> list[str]:
+    executable = shutil.which(backend)
+    if not executable:
+        raise AdapterUnavailable(f"{backend} CLI is unavailable")
+    if backend == "codex":
+        return codex_command(executable, model)
+    if backend == "pi":
+        command = [executable, "--print", "--no-session", "--no-tools", "--no-extensions", "--no-skills",
+                   "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve", "--mode", "text"]
+        if model:
+            command.extend(["--model", model])
+        return command
+    if backend == "claude":
+        command = [executable, "--print", "--no-session-persistence", "--safe-mode", "--restricted",
+                   "--strict-mcp-config", "--permission-mode", "plan", "--permission-prompts", "none",
+                   "--tools", "", "--no-chrome"]
+        if model:
+            command.extend(["--model", model])
+        return command
+    raise AdapterUnavailable("OpenCode does not provide a verified noninteractive no-tools/no-MCP isolation mode")
+
+
+def ask(item: dict) -> None:
+    payload = verify(item)
+    default_backend, model, timeout = qa_settings()
+    selected = input(f"Q&A backend [{default_backend}] (codex, pi, claude, opencode): ").strip().lower()
+    backend = selected or default_backend
+    if backend not in BACKENDS:
+        print(f"Unsupported Q&A backend: {backend}", file=sys.stderr)
+        return
+    question = input(f"Question for {backend} (blank cancels): ").strip()
+    if not question:
+        return
     try:
-        result = subprocess.run([codex, "exec", "--help"], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        if result.returncode != 0:
-            raise QueueError("Codex CLI cannot provide non-interactive help")
-        listed = subprocess.run([codex, "mcp", "list", "--json"], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=True)
-        servers = json.loads(listed.stdout)
-        if not isinstance(servers, list) or any(not isinstance(server, dict) or not isinstance(server.get("name"), str) or not server["name"].replace("-", "").replace("_", "").isalnum() for server in servers):
-            raise QueueError("cannot safely disable configured Codex connectors")
-        disable_mcp = [part for server in servers for part in ("-c", f"mcp_servers.{server['name']}.enabled=false")]
-        effective = subprocess.run([codex, *disable_mcp, "mcp", "list", "--json"], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=True)
-        effective_servers = json.loads(effective.stdout)
-        if not isinstance(effective_servers, list) or any(server.get("enabled") for server in effective_servers if isinstance(server, dict)):
-            raise QueueError("configured Codex connectors remained enabled")
-        # `exec` accepts its prompt as an argument on supported CLI releases.
-        completed = subprocess.run([codex, "exec", *disable_mcp, "--sandbox", "read-only", "--ephemeral",
-                                    "--ignore-rules", "--disable", "apps", "--disable", "plugins",
-                                    "--disable", "hooks", "--disable", "browser_use", "--disable", "computer_use",
-                                    "--disable", "in_app_browser", "--skip-git-repo-check",
-                                    "-C", str(PAYLOADS), prompt], stdin=subprocess.DEVNULL,
-                                   text=True, timeout=120)
+        command = adapter_command(backend, model)
+        completed = subprocess.run([*command, qa_prompt(payload, question)], stdin=subprocess.DEVNULL,
+                                   cwd=PAYLOADS, text=True, timeout=timeout)
         if completed.returncode:
-            print(f"Codex Q&A exited {completed.returncode}; queue unchanged.", file=sys.stderr)
+            print(f"{backend} Q&A exited {completed.returncode}; queue unchanged.", file=sys.stderr)
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError, QueueError) as exc:
-        print(f"Codex Q&A unavailable ({exc}); queue unchanged.", file=sys.stderr)
+        print(f"{backend} Q&A unavailable ({exc}); queue unchanged.", file=sys.stderr)
 
 
 def execution_snapshot(item: dict, run_dir: pathlib.Path) -> pathlib.Path:
@@ -392,6 +475,32 @@ def results(args: argparse.Namespace) -> int:
     return 0
 
 
+def config_show(_: argparse.Namespace) -> int:
+    backend, model, timeout = qa_settings()
+    print(json.dumps({"qa": {"backend": backend, "model": model, "timeout_seconds": timeout},
+                      "config_path": str(CONFIG),
+                      "precedence": "SCRIPTDECK_QA_* environment variables override config values"}, indent=2))
+    return 0
+
+
+def config_set_backend(args: argparse.Namespace) -> int:
+    save_qa_setting("backend", args.backend)
+    print(f"Saved Q&A backend: {args.backend}")
+    return 0
+
+
+def config_set_model(args: argparse.Namespace) -> int:
+    save_qa_setting("model", args.model)
+    print("Saved Q&A model.")
+    return 0
+
+
+def config_set_timeout(args: argparse.Namespace) -> int:
+    save_qa_setting("timeout_seconds", args.seconds)
+    print(f"Saved Q&A timeout: {args.seconds} seconds")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog=os.environ.get("SCRIPTDECK_PROG"), description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -406,6 +515,15 @@ def main() -> int:
     list_parser.add_argument("--include-ran", action="store_true", help="include completed items and their final statuses")
     list_parser.set_defaults(func=list_items)
     result = commands.add_parser("results", help="show saved run records"); result.add_argument("id", nargs="?"); result.set_defaults(func=results)
+    config_parser = commands.add_parser("config", help="show or save non-secret Q&A settings")
+    config_commands = config_parser.add_subparsers(dest="config_command", required=True)
+    config_commands.add_parser("show", help="show effective non-secret Q&A settings").set_defaults(func=config_show)
+    backend_parser = config_commands.add_parser("set-qa-backend", help="save the default Q&A backend")
+    backend_parser.add_argument("backend", choices=sorted(BACKENDS)); backend_parser.set_defaults(func=config_set_backend)
+    model_parser = config_commands.add_parser("set-qa-model", help="save an optional Q&A model name")
+    model_parser.add_argument("model"); model_parser.set_defaults(func=config_set_model)
+    timeout_parser = config_commands.add_parser("set-qa-timeout", help="save a Q&A timeout in seconds")
+    timeout_parser.add_argument("seconds", type=int); timeout_parser.set_defaults(func=config_set_timeout)
     args = parser.parse_args()
     try: return args.func(args)
     except QueueError as exc: print(f"error: {exc}", file=sys.stderr); return 2

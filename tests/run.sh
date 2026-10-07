@@ -2,6 +2,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 export SCRIPTDECK_HOME="$work/queue"
@@ -66,5 +67,7 @@ printf '#!/bin/sh\necho changed\n' > "$SCRIPTDECK_HOME/payloads/$id.sh"
 chmod 700 "$SCRIPTDECK_HOME/payloads/$id.sh"
 if printf 's\nr\n' | python3 "$root/scriptdeck.py" review --include-ran > /dev/null 2> "$work/tamper.err"; then exit 1; fi
 grep -q 'payload changed for' "$work/tamper.err"
+
+python3 tests/qa_adapters.py
 
 echo 'ScriptDeck tests passed'
