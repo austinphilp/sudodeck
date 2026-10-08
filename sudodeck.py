@@ -36,6 +36,7 @@ RUNS = ROOT / "runs"
 LOCK = ROOT / ".lock"
 CONFIG = pathlib.Path(os.environ.get("SUDODECK_CONFIG", os.environ.get("SCRIPTDECK_CONFIG", DEFAULT_CONFIG)))
 BACKENDS = {"codex", "pi", "claude", "opencode"}
+DEFAULT_ACTIONS = {"none", "run", "edit", "ask", "deny", "quit"}
 
 
 class QueueError(RuntimeError):
@@ -95,6 +96,31 @@ def save_qa_setting(key: str, value: object) -> None:
     candidate[key] = value
     validate_qa_settings(candidate.get("backend", "codex"), candidate.get("model"), candidate.get("timeout_seconds", 120))
     qa[key] = value
+    private_dir(CONFIG.parent)
+    atomic_json(CONFIG, config)
+
+
+def validate_default_action(value: object) -> str:
+    if not isinstance(value, str) or value not in DEFAULT_ACTIONS:
+        raise QueueError(f"invalid default action; choose one of: {', '.join(sorted(DEFAULT_ACTIONS))}")
+    return value
+
+
+def default_action() -> str:
+    config = checked_config().get("review", {})
+    if not isinstance(config, dict):
+        raise QueueError("invalid review config")
+    return validate_default_action(os.environ.get("SUDODECK_DEFAULT_ACTION",
+                                   os.environ.get("SCRIPTDECK_DEFAULT_ACTION", config.get("default_action", "none"))))
+
+
+def save_default_action(value: str) -> None:
+    action = validate_default_action(value)
+    config = checked_config()
+    review_config = config.setdefault("review", {})
+    if not isinstance(review_config, dict):
+        raise QueueError("invalid review config")
+    review_config["default_action"] = action
     private_dir(CONFIG.parent)
     atomic_json(CONFIG, config)
 
@@ -457,12 +483,16 @@ def run_qa_harness(command: list[str], prompt: str, timeout: int, environment: d
 def ask(item: dict) -> None:
     payload = verify(item)
     default_backend, model, timeout = qa_settings()
-    selected = input(f"Q&A backend [{default_backend}] (codex, pi, claude, opencode): ").strip().lower()
+    try:
+        selected = input(f"Q&A backend [{default_backend}] (codex, pi, claude, opencode): ").strip().lower()
+        question = input(f"Question for {selected or default_backend} (blank cancels): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("Q&A cancelled; queue unchanged.", file=sys.stderr)
+        return
     backend = selected or default_backend
     if backend not in BACKENDS:
         print(f"Unsupported Q&A backend: {backend}", file=sys.stderr)
         return
-    question = input(f"Question for {backend} (blank cancels): ").strip()
     if not question:
         return
     try:
@@ -612,6 +642,21 @@ def visible_items(include_ran: bool, include_denied: bool) -> list[dict]:
             if (include_denied or not is_denied(item)) and (include_ran or not is_completed(item))]
 
 
+def review_prompt(item: dict, configured_action: str) -> tuple[str, str | None]:
+    if is_denied(item):
+        choices = "[e]dit/review [a]sk Q&A [c]onsider again [q]uit"
+        supported = {"edit": "e", "ask": "a", "quit": "q"}
+    elif is_completed(item):
+        choices = "[e]dit/review [a]sk Q&A [r]erun [d]eny [q]uit"
+        supported = {"run": "r", "edit": "e", "ask": "a", "deny": "d", "quit": "q"}
+    else:
+        choices = "[e]dit/review [a]sk Q&A [r]un [d]eny [q]uit"
+        supported = {"run": "r", "edit": "e", "ask": "a", "deny": "d", "quit": "q"}
+    shortcut = supported.get(configured_action)
+    label = configured_action.title() if shortcut else "No action"
+    return f"{choices} [Enter: {label}]: ", shortcut
+
+
 def review(show_hash: bool = False, include_ran: bool = False, include_denied: bool = False) -> int:
     with lock():
         queued = visible_items(include_ran, include_denied)
@@ -622,13 +667,19 @@ def review(show_hash: bool = False, include_ran: bool = False, include_denied: b
             print("\n" + "=" * 72)
             print(describe(item, show_hash) + f"\nState: {execution_label(item)}")
             while True:
-                if is_denied(item):
-                    prompt = "[e]dit/review [a]sk Q&A [c]onsider again [q]uit: "
-                elif is_completed(item):
-                    prompt = "[e]dit/review [a]sk Q&A [r]erun [d]eny [q]uit: "
-                else:
-                    prompt = "[e]dit/review [a]sk Q&A [r]un [d]eny [q]uit: "
-                action = input(prompt).strip().lower()
+                prompt, enter_action = review_prompt(item, default_action())
+                try:
+                    raw_action = input(prompt)
+                except EOFError:
+                    print("Review input closed; no action taken.", file=sys.stderr)
+                    return 0
+                except KeyboardInterrupt:
+                    print("Review interrupted; no action taken.", file=sys.stderr)
+                    return 0
+                action = raw_action.strip().lower() or enter_action
+                if action is None:
+                    print("No action selected.")
+                    continue
                 if action == "e": edit_review(item)
                 elif action == "a": ask(item)
                 elif action == "c" and is_denied(item): reconsider(item)
@@ -697,8 +748,9 @@ def history(args: argparse.Namespace) -> int:
 def config_show(_: argparse.Namespace) -> int:
     backend, model, timeout = qa_settings()
     print(json.dumps({"qa": {"backend": backend, "model": model, "timeout_seconds": timeout},
+                      "review": {"default_action": default_action()},
                       "config_path": str(CONFIG),
-                      "precedence": "SUDODECK_QA_* then deprecated SCRIPTDECK_QA_* environment variables override config values"}, indent=2))
+                      "precedence": "SUDODECK_QA_* and SUDODECK_DEFAULT_ACTION, then deprecated SCRIPTDECK_* environment variables, override config values"}, indent=2))
     return 0
 
 
@@ -717,6 +769,12 @@ def config_set_model(args: argparse.Namespace) -> int:
 def config_set_timeout(args: argparse.Namespace) -> int:
     save_qa_setting("timeout_seconds", args.seconds)
     print(f"Saved Q&A timeout: {args.seconds} seconds")
+    return 0
+
+
+def config_set_default_action(args: argparse.Namespace) -> int:
+    save_default_action(args.action)
+    print(f"Saved review default action: {args.action}")
     return 0
 
 
@@ -785,7 +843,7 @@ def main() -> int:
     history_parser = commands.add_parser("history", help="emit queue metadata, including denial records, as JSON")
     history_parser.add_argument("id", nargs="?")
     history_parser.set_defaults(func=history)
-    config_parser = commands.add_parser("config", help="show or save non-secret Q&A settings")
+    config_parser = commands.add_parser("config", help="show or save non-secret Q&A and review settings")
     config_commands = config_parser.add_subparsers(dest="config_command", required=True)
     config_commands.add_parser("show", help="show effective non-secret Q&A settings").set_defaults(func=config_show)
     backend_parser = config_commands.add_parser("set-qa-backend", help="save the default Q&A backend")
@@ -794,6 +852,8 @@ def main() -> int:
     model_parser.add_argument("model"); model_parser.set_defaults(func=config_set_model)
     timeout_parser = config_commands.add_parser("set-qa-timeout", help="save a Q&A timeout in seconds")
     timeout_parser.add_argument("seconds", type=int); timeout_parser.set_defaults(func=config_set_timeout)
+    action_parser = config_commands.add_parser("set-default-action", help="save the action selected by Enter at the script prompt")
+    action_parser.add_argument("action", choices=sorted(DEFAULT_ACTIONS)); action_parser.set_defaults(func=config_set_default_action)
     commands.add_parser("migrate", help="explicitly move legacy ScriptDeck default-path state into SudoDeck; never merges or overwrites").set_defaults(func=migrate)
     args = parser.parse_args()
     try: return args.func(args)

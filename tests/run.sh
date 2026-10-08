@@ -26,13 +26,36 @@ grep -q 'Risks: None' "$work/review.out"
 grep -q '\[d\]eny' "$work/review.out"
 if grep -q "$hash" "$work/review.out"; then exit 1; fi
 test ! -d "$SUDODECK_HOME/runs/$id"
-printf 'r\n' | python3 "$root/sudodeck.py" review > "$work/display.out" 2> "$work/display.err"
+
+# The built-in Enter behavior is safe. Q&A and closed stdin cannot inherit a run default.
+printf '\nq\n' | python3 "$root/sudodeck.py" review > "$work/default-none.out"
+grep -q '\[Enter: No action\]' "$work/default-none.out"
+grep -q 'No action selected.' "$work/default-none.out"
+test ! -d "$SUDODECK_HOME/runs/$id"
+python3 "$root/sudodeck.py" config set-default-action run > "$work/default-run-config.out"
+grep -q 'Saved review default action: run' "$work/default-run-config.out"
+printf 'a\n\n\n' | python3 "$root/sudodeck.py" review > "$work/submenu.out" 2> "$work/submenu.err"
+test ! -d "$SUDODECK_HOME/runs/$id"
+: | python3 "$root/sudodeck.py" review > "$work/eof.out" 2> "$work/eof.err"
+grep -q 'Review input closed; no action taken.' "$work/eof.err"
+test ! -d "$SUDODECK_HOME/runs/$id"
+SUDODECK_DEFAULT_ACTION=edit python3 "$root/sudodeck.py" config show > "$work/env-precedence.json"
+ENV_CONFIG="$work/env-precedence.json" python3 - <<'PY'
+import json, os
+assert json.load(open(os.environ["ENV_CONFIG"]))["review"]["default_action"] == "edit"
+PY
+if SUDODECK_DEFAULT_ACTION=invalid python3 "$root/sudodeck.py" config show > /dev/null 2> "$work/invalid-action.err"; then exit 1; fi
+grep -q 'invalid default action' "$work/invalid-action.err"
+printf '\n' | python3 "$root/sudodeck.py" review > "$work/display.out" 2> "$work/display.err"
+grep -q '\[Enter: Run\]' "$work/display.out"
 if grep -q 'Type RUN' "$work/display.out"; then exit 1; fi
 result=$(find "$SUDODECK_HOME/runs/$id" -name result.json -print -quit)
 grep -q '"status": "succeeded"' "$result"
 grep -q hello-test "$(dirname "$result")/stdout.log"
 grep -q stderr-test "$(dirname "$result")/stderr.log"
 test "$(sha256sum "$(dirname "$result")/payload.sh" | awk '{print $1}')" = "$hash"
+test "$(find "$SUDODECK_HOME/runs/$id" -name result.json | wc -l)" -eq 1
+python3 "$root/sudodeck.py" config set-default-action none >/dev/null
 python3 "$root/sudodeck.py" list > "$work/post-run-list.out"
 if grep -q 'Harmless fixture' "$work/post-run-list.out"; then exit 1; fi
 python3 "$root/sudodeck.py" list --include-ran > "$work/history-list.out"

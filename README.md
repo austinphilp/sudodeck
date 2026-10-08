@@ -27,6 +27,12 @@ Use `e` to edit/review a private working copy in `$EDITOR` (arguments such as `c
 
 Choose `d` to deny the current revision instead of running it. SudoDeck optionally records the user's reason and a durable denial ID, timestamp, revision number, and digest; denial never creates a run. Denied items are hidden like completed items. Use `list --include-denied`, `review --include-denied` and explicitly type `RECONSIDER` to return one to pending review. Editing a denied item creates a new pending revision; it never approves or runs it.
 
+At the script-choice prompt, Enter can use a saved default action: `none` (the safe built-in default), `run`, `edit`, `ask`, `deny`, or `quit`. The prompt always shows the resolved behavior, for example `[Enter: Run]`. Closed stdin and Ctrl-C always take no action; the setting never applies inside the Q&A, denial-reason, or reconsideration prompts. Set it explicitly only when you want it:
+
+```sh
+sudodeck config set-default-action run
+```
+
 Completed items are hidden by default but retain private results/logs. Use `list --include-ran`, `results [ID]`, `history [ID]`, or `review --include-ran` for history and deliberate reruns. `list --include-denied --json`, `results ID`, and `history ID` expose denial records for tools and agents. Denial reasons are untrusted local data and are JSON-escaped, not approval or instructions. Output is not redacted and may contain secrets.
 
 ## Q&A harnesses
@@ -51,6 +57,8 @@ sudodeck config set-qa-timeout 90
 ```
 
 `SUDODECK_QA_BACKEND`, `SUDODECK_QA_MODEL`, and `SUDODECK_QA_TIMEOUT_SECONDS` override config. Deprecated `SCRIPTDECK_*` variables apply only when the matching `SUDODECK_*` value is absent.
+
+`SUDODECK_DEFAULT_ACTION` similarly overrides the saved review default for one invocation. `SUDODECK_DEFAULT_ACTION=run sudodeck review` affects only Enter at an eligible script prompt; it does not grant privileges or approve scripts by itself.
 
 ## Agent skill
 
