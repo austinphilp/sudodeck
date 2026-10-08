@@ -18,12 +18,13 @@ grep -q 'Harmless fixture' "$work/list.out"
 if grep -q "$hash" "$work/list.out"; then exit 1; fi
 python3 "$root/sudodeck.py" list --show-sha256 > "$work/list-hash.out"
 grep -q "$hash" "$work/list-hash.out"
-printf 's\n' | python3 "$root/sudodeck.py" review > "$work/skip.out"
-grep -q 'Title: Harmless fixture' "$work/skip.out"
-grep -q 'Summary: Prints test output' "$work/skip.out"
-grep -q 'Affects: Temporary test files' "$work/skip.out"
-grep -q 'Risks: None' "$work/skip.out"
-if grep -q "$hash" "$work/skip.out"; then exit 1; fi
+printf 'q\n' | python3 "$root/sudodeck.py" review > "$work/review.out"
+grep -q 'Title: Harmless fixture' "$work/review.out"
+grep -q 'Summary: Prints test output' "$work/review.out"
+grep -q 'Affects: Temporary test files' "$work/review.out"
+grep -q 'Risks: None' "$work/review.out"
+grep -q '\[d\]eny' "$work/review.out"
+if grep -q "$hash" "$work/review.out"; then exit 1; fi
 test ! -d "$SUDODECK_HOME/runs/$id"
 printf 'r\n' | python3 "$root/sudodeck.py" review > "$work/display.out" 2> "$work/display.err"
 if grep -q 'Type RUN' "$work/display.out"; then exit 1; fi
@@ -37,12 +38,49 @@ if grep -q 'Harmless fixture' "$work/post-run-list.out"; then exit 1; fi
 python3 "$root/sudodeck.py" list --include-ran > "$work/history-list.out"
 grep -q '\[SUCCEEDED, exit 0\].*Harmless fixture' "$work/history-list.out"
 
+printf '#!/bin/sh\necho must-not-run\n' > "$work/deny.sh"
+chmod 700 "$work/deny.sh"
+denied_id=$(python3 "$root/sudodeck.py" add "$work/deny.sh" --title 'Denied fixture' --summary 'Must remain unexecuted' --affects 'Temporary test files' --risks 'None')
+printf 'd\nnot approved\n' | python3 "$root/sudodeck.py" review > "$work/deny.out"
+grep -q 'Denied; the queued revision was not executed' "$work/deny.out"
+test ! -d "$SUDODECK_HOME/runs/$denied_id"
+python3 "$root/sudodeck.py" list > "$work/denied-default-list.out"
+if grep -q 'Denied fixture' "$work/denied-default-list.out"; then exit 1; fi
+printf 'q\n' | python3 "$root/sudodeck.py" review > "$work/denied-default-review.out"
+if grep -q 'Denied fixture' "$work/denied-default-review.out"; then exit 1; fi
+python3 "$root/sudodeck.py" list --include-denied > "$work/denied-list.out"
+grep -q '\[DENIED\].*Denied fixture' "$work/denied-list.out"
+python3 "$root/sudodeck.py" list --include-denied --json > "$work/denied-list.json"
+python3 "$root/sudodeck.py" results "$denied_id" > "$work/denied-results.json"
+python3 "$root/sudodeck.py" history "$denied_id" > "$work/denied-history.json"
+DENIED_LIST="$work/denied-list.json" DENIED_RESULTS="$work/denied-results.json" DENIED_HISTORY="$work/denied-history.json" python3 - <<'PY'
+import json, os
+for path in (os.environ["DENIED_LIST"], os.environ["DENIED_RESULTS"], os.environ["DENIED_HISTORY"]):
+    value = json.load(open(path))
+    text = json.dumps(value)
+    assert "not approved" in text and "denial_id" in text
+PY
+printf 'c\nRECONSIDER\nq\n' | python3 "$root/sudodeck.py" review --include-denied > "$work/reconsider.out"
+grep -q 'Denial retained in history' "$work/reconsider.out"
+python3 "$root/sudodeck.py" list > "$work/reconsider-list.out"
+grep -q 'Denied fixture' "$work/reconsider-list.out"
+printf 'd\nkept denied\n' | python3 "$root/sudodeck.py" review > "$work/redeny.out"
+
+blank_id=$(python3 "$root/sudodeck.py" add "$work/deny.sh" --title 'Blank denial fixture' --summary 'Must remain unexecuted' --affects 'Temporary test files' --risks 'None')
+printf 'd\n\n' | python3 "$root/sudodeck.py" review > "$work/blank-deny.out"
+python3 "$root/sudodeck.py" history "$blank_id" > "$work/blank-deny.json"
+BLANK_DENY="$work/blank-deny.json" python3 - <<'PY'
+import json, os
+assert json.load(open(os.environ["BLANK_DENY"]))["items"][0]["denials"][0]["reason"] == ""
+PY
+test ! -d "$SUDODECK_HOME/runs/$blank_id"
+
 legacy_id=legacy-item
 printf '#!/bin/sh\necho legacy\n' > "$SUDODECK_HOME/payloads/$legacy_id.sh"
 chmod 700 "$SUDODECK_HOME/payloads/$legacy_id.sh"
 printf '{"id":"legacy-item","created_at":"2000-01-01T00:00:00+00:00","description":"Legacy description","sha256":"%s","runs":[]}' "$(sha256sum "$SUDODECK_HOME/payloads/$legacy_id.sh" | awk '{print $1}')" > "$SUDODECK_HOME/metadata/$legacy_id.json"
 chmod 600 "$SUDODECK_HOME/metadata/$legacy_id.json"
-printf 's\n' | python3 "$root/sudodeck.py" review > "$work/legacy.out"
+printf 'q\n' | python3 "$root/sudodeck.py" review > "$work/legacy.out"
 grep -q 'Title: Legacy description' "$work/legacy.out"
 grep -q 'Affects: Not recorded (legacy item).' "$work/legacy.out"
 grep -q 'Risks: Not recorded (legacy item).' "$work/legacy.out"
@@ -52,7 +90,7 @@ grep -q 'Legacy description' "$work/legacy-pending.out"
 printf '#!/bin/sh\nexit 7\n' > "$work/failure.sh"
 chmod 700 "$work/failure.sh"
 failure_id=$(python3 "$root/sudodeck.py" add "$work/failure.sh" --title 'Failure fixture' --summary 'Exits 7' --affects 'Temporary test files' --risks 'Expected test failure')
-printf 's\nr\n' | python3 "$root/sudodeck.py" review > "$work/failure.out" 2> "$work/failure.err"
+printf 'd\nlegacy not selected\nr\n' | python3 "$root/sudodeck.py" review > "$work/failure.out" 2> "$work/failure.err"
 failure_result=$(find "$SUDODECK_HOME/runs/$failure_id" -name result.json -print -quit)
 grep -q '"status": "failed"' "$failure_result"
 grep -q '"exit_code": 7' "$failure_result"
@@ -60,12 +98,12 @@ python3 "$root/sudodeck.py" list > "$work/pending-after-failure.out"
 if grep -q 'Failure fixture' "$work/pending-after-failure.out"; then exit 1; fi
 python3 "$root/sudodeck.py" list --include-ran > "$work/history-after-failure.out"
 grep -q '\[FAILED, exit 7\].*Failure fixture' "$work/history-after-failure.out"
-printf 's\ns\ns\n' | python3 "$root/sudodeck.py" review --include-ran > "$work/rerun-menu.out"
+printf 'q\n' | python3 "$root/sudodeck.py" review --include-ran > "$work/rerun-menu.out"
 grep -q '\[r\]erun' "$work/rerun-menu.out"
 
 printf '#!/bin/sh\necho changed\n' > "$SUDODECK_HOME/payloads/$id.sh"
 chmod 700 "$SUDODECK_HOME/payloads/$id.sh"
-if printf 's\nr\n' | python3 "$root/sudodeck.py" review --include-ran > /dev/null 2> "$work/tamper.err"; then exit 1; fi
+if printf 'r\n' | python3 "$root/sudodeck.py" review --include-ran > /dev/null 2> "$work/tamper.err"; then exit 1; fi
 grep -q 'payload changed for' "$work/tamper.err"
 
 python3 tests/qa_adapters.py

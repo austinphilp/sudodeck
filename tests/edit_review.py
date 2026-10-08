@@ -15,7 +15,8 @@ with tempfile.TemporaryDirectory() as work:
     payload.write_text("#!/bin/sh\necho original\n")
     os.chmod(payload, 0o700)
     digest = module["sha256"](payload)
-    item = {"id": "edit-item", "created_at": "x", "title": "Edit test", "summary": "x", "affects": "x", "risks": "x", "sha256": digest, "runs": []}
+    item = {"id": "edit-item", "created_at": "x", "title": "Edit test", "summary": "x", "affects": "x", "risks": "x", "sha256": digest, "runs": [],
+            "denials": [{"denial_id": "old-denial", "denied_at": "x", "sha256": digest, "revision": 0, "reason": "old revision"}]}
     module["atomic_json"](pathlib.Path(module["META"]) / "edit-item.json", item)
 
     source = pathlib.Path(work) / "original.sh"
@@ -29,6 +30,7 @@ with tempfile.TemporaryDirectory() as work:
     assert source.read_text() == "#!/bin/sh\necho original\n"
     saved = module["load"]("edit-item")
     assert saved["sha256"] != digest and len(saved["revisions"]) == 1
+    assert not module["is_denied"](saved)  # a new revision is pending, never auto-approved/executed
     assert "echo edited" in module["qa_prompt"](payload, "what changed?")
     assert not list(pathlib.Path(module["RUNS"]).glob("**/result.json"))
 

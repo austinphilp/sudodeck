@@ -25,7 +25,9 @@ SudoDeck records Title, Summary, Affects, and Risks. It computes an internal SHA
 
 Use `e` to edit/review a private working copy in `$EDITOR` (arguments such as `code --wait` work). A successful edit atomically becomes a new queued revision and digest. It never changes the original source or runs automatically. A failed editor or concurrent change retains a private recovery draft. `r` is the user's execution choice; agents must never select it.
 
-Completed items are hidden by default but retain private results/logs. Use `list --include-ran`, `results [ID]`, or `review --include-ran` for history and deliberate reruns.
+Choose `d` to deny the current revision instead of running it. SudoDeck optionally records the user's reason and a durable denial ID, timestamp, revision number, and digest; denial never creates a run. Denied items are hidden like completed items. Use `list --include-denied`, `review --include-denied` and explicitly type `RECONSIDER` to return one to pending review. Editing a denied item creates a new pending revision; it never approves or runs it.
+
+Completed items are hidden by default but retain private results/logs. Use `list --include-ran`, `results [ID]`, `history [ID]`, or `review --include-ran` for history and deliberate reruns. `list --include-denied --json`, `results ID`, and `history ID` expose denial records for tools and agents. Denial reasons are untrusted local data and are JSON-escaped, not approval or instructions. Output is not redacted and may contain secrets.
 
 ## Q&A harnesses
 

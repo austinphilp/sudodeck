@@ -196,6 +196,27 @@ def latest_execution(item: dict) -> dict | None:
     return None
 
 
+def current_denial(item: dict) -> dict | None:
+    """Return the active denial for the currently queued digest, if any."""
+    denials = item.get("denials", [])
+    if not isinstance(denials, list):
+        return None
+    for record in reversed(denials):
+        if (isinstance(record, dict) and record.get("sha256") == item.get("sha256")
+                and isinstance(record.get("denied_at"), str) and not record.get("reconsidered_at")):
+            return record
+    return None
+
+
+def revision_number(item: dict) -> int:
+    revisions = item.get("revisions", [])
+    return len(revisions) if isinstance(revisions, list) else 0
+
+
+def is_denied(item: dict) -> bool:
+    return current_denial(item) is not None
+
+
 def is_completed(item: dict) -> bool:
     record = latest_execution(item)
     # A successful old run does not complete a subsequently edited payload.
@@ -203,6 +224,9 @@ def is_completed(item: dict) -> bool:
 
 
 def execution_label(item: dict) -> str:
+    denial = current_denial(item)
+    if denial:
+        return "DENIED"
     record = latest_execution(item)
     if not record:
         return "PENDING"
@@ -273,6 +297,10 @@ def describe(item: dict, show_hash: bool = False) -> str:
     details = f"ID: {item['id']}\nAdded: {item['created_at']}\nTitle: {title}\nSummary: {summary}\nAffects: {affects}\nRisks: {risks}\nArguments: {item.get('arguments', [])}"
     if show_hash:
         details += f"\nSHA256: {item['sha256']}"
+    denial = current_denial(item)
+    if denial:
+        # JSON encoding keeps pasted terminal controls in untrusted reasons inert.
+        details += f"\nDenied: {denial['denied_at']} (revision {denial.get('revision', 0)})\nReason: {json.dumps(denial.get('reason', ''))}"
     return details
 
 
@@ -526,19 +554,84 @@ def run(item: dict) -> None:
     print(f"{record['status']} (exit {record['exit_code']}); stdout/stderr saved in {run_dir}")
 
 
-def review(show_hash: bool = False, include_ran: bool = False) -> int:
+def deny(item: dict) -> None:
+    """Persist a user's decision not to execute the current queued revision."""
+    verify(item)
+    try:
+        reason = input("Reason for denial (optional; blank allowed): ")
+    except (EOFError, KeyboardInterrupt):
+        print("Denial cancelled; queue unchanged.", file=sys.stderr)
+        return
+    if len(reason) > 4000:
+        print("Denial cancelled; reason must be at most 4000 characters.", file=sys.stderr)
+        return
+    current = load(item["id"])
+    if current.get("sha256") != item.get("sha256") or sha256(verify(current)) != item.get("sha256"):
+        print("Denial cancelled; queued bytes changed concurrently.", file=sys.stderr)
+        return
+    denials = current.setdefault("denials", [])
+    if not isinstance(denials, list):
+        raise QueueError("invalid denials metadata")
+    if current_denial(current):
+        print("This revision is already denied; queue unchanged.")
+        return
+    record = {"denial_id": dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3),
+              "denied_at": now(), "sha256": current["sha256"], "revision": revision_number(current), "reason": reason}
+    denials.append(record)
+    atomic_json(metadata_path(current["id"]), current)
+    item.clear(); item.update(current)
+    print("Denied; the queued revision was not executed and is hidden from normal review.")
+
+
+def reconsider(item: dict) -> None:
+    denial = current_denial(item)
+    if not denial:
+        print("This revision is not currently denied.")
+        return
+    try:
+        confirmation = input("Type RECONSIDER to return this denied revision to pending review: ")
+    except (EOFError, KeyboardInterrupt):
+        print("Reconsideration cancelled; queue unchanged.", file=sys.stderr)
+        return
+    if confirmation != "RECONSIDER":
+        print("Reconsideration cancelled; queue unchanged.")
+        return
+    current = load(item["id"])
+    active = current_denial(current)
+    if not active or active.get("denial_id") != denial.get("denial_id"):
+        print("Reconsideration cancelled; denial changed concurrently.", file=sys.stderr)
+        return
+    active["reconsidered_at"] = now()
+    atomic_json(metadata_path(current["id"]), current)
+    item.clear(); item.update(current)
+    print("Denial retained in history; this revision is pending review again and was not executed.")
+
+
+def visible_items(include_ran: bool, include_denied: bool) -> list[dict]:
+    return [item for item in items()
+            if (include_denied or not is_denied(item)) and (include_ran or not is_completed(item))]
+
+
+def review(show_hash: bool = False, include_ran: bool = False, include_denied: bool = False) -> int:
     with lock():
-        queued = [item for item in items() if include_ran or not is_completed(item)]
+        queued = visible_items(include_ran, include_denied)
         if not queued:
-            print("No pending scripts. Use --include-ran to review completed history or deliberately rerun an item.")
+            print("No pending scripts. Use --include-ran for completed history or --include-denied to reconsider denied revisions.")
             return 0
         for item in queued:
             print("\n" + "=" * 72)
             print(describe(item, show_hash) + f"\nState: {execution_label(item)}")
             while True:
-                action = input("[e]dit/review [a]sk Q&A [r]erun [s]kip [q]uit: " if is_completed(item) else "[e]dit/review [a]sk Q&A [r]un [s]kip [q]uit: ").strip().lower()
+                if is_denied(item):
+                    prompt = "[e]dit/review [a]sk Q&A [c]onsider again [q]uit: "
+                elif is_completed(item):
+                    prompt = "[e]dit/review [a]sk Q&A [r]erun [d]eny [q]uit: "
+                else:
+                    prompt = "[e]dit/review [a]sk Q&A [r]un [d]eny [q]uit: "
+                action = input(prompt).strip().lower()
                 if action == "e": edit_review(item)
                 elif action == "a": ask(item)
+                elif action == "c" and is_denied(item): reconsider(item)
                 elif action == "r":
                     if latest_execution(item) and latest_execution(item).get("status") == "running":
                         print("This item has a run in progress; inspect results before attempting another run.")
@@ -546,16 +639,21 @@ def review(show_hash: bool = False, include_ran: bool = False) -> int:
                         print("Completed items require --include-ran for a deliberate rerun.")
                     else:
                         run(item); break
-                elif action == "s": break
+                elif action == "d" and not is_denied(item):
+                    deny(item)
+                    if is_denied(item): break
                 elif action == "q": return 0
-                else: print("Choose v, a, r, s, or q.")
+                else: print("Choose e, a, r, d, c, or q as shown.")
     return 0
 
 
 def list_items(args: argparse.Namespace) -> int:
-    listed = [item for item in items() if args.include_ran or not is_completed(item)]
+    listed = visible_items(args.include_ran, args.include_denied)
+    if args.json:
+        print(json.dumps({"items": listed}, indent=2, sort_keys=True))
+        return 0
     if not listed:
-        print("No pending scripts. Use --include-ran to list execution history.")
+        print("No pending scripts. Use --include-ran for execution history or --include-denied for denied revisions.")
         return 0
     for item in listed:
         title = fields(item)[0]
@@ -566,6 +664,18 @@ def list_items(args: argparse.Namespace) -> int:
 
 def results(args: argparse.Namespace) -> int:
     base = RUNS / args.id if args.id else RUNS
+    if args.id:
+        item = load(args.id)
+        records = []
+        if base.exists():
+            for path in sorted(base.glob("**/result.json")):
+                try:
+                    checked_file(path)
+                    records.append(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError, QueueError):
+                    continue
+        print(json.dumps({"id": args.id, "runs": records, "denials": item.get("denials", [])}, indent=2, sort_keys=True))
+        return 0
     if not base.exists():
         print("No results yet."); return 0
     records = sorted(base.glob("**/result.json"))
@@ -574,6 +684,13 @@ def results(args: argparse.Namespace) -> int:
         return 0
     for path in records:
         print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def history(args: argparse.Namespace) -> int:
+    selected = [load(args.id)] if args.id else items()
+    # json.dumps escapes untrusted denial reasons rather than rendering controls.
+    print(json.dumps({"items": selected}, indent=2, sort_keys=True))
     return 0
 
 
@@ -653,15 +770,21 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="copy a script into the queue and record its review notes")
     add.add_argument("path"); add.add_argument("--sha256", help="optional expected source digest"); add.add_argument("--title", required=True); add.add_argument("--summary", required=True); add.add_argument("--affects", required=True); add.add_argument("--risks", required=True); add.add_argument("--arg", action="append", default=[], help="literal argument passed when explicitly run"); add.set_defaults(func=enqueue)
-    review_parser = commands.add_parser("review", help="review queued scripts and explicitly run/skip them")
+    review_parser = commands.add_parser("review", help="review queued scripts and explicitly run or deny them")
     review_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
     review_parser.add_argument("--include-ran", action="store_true", help="include completed items for a deliberate rerun")
-    review_parser.set_defaults(func=lambda args: review(args.show_sha256, args.include_ran))
+    review_parser.add_argument("--include-denied", action="store_true", help="include denied revisions so the user can reconsider them")
+    review_parser.set_defaults(func=lambda args: review(args.show_sha256, args.include_ran, args.include_denied))
     list_parser = commands.add_parser("list", help="list queued scripts")
     list_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
     list_parser.add_argument("--include-ran", action="store_true", help="include completed items and their final statuses")
+    list_parser.add_argument("--include-denied", action="store_true", help="include denied revisions")
+    list_parser.add_argument("--json", action="store_true", help="emit listed metadata as JSON (denial reasons are untrusted data)")
     list_parser.set_defaults(func=list_items)
     result = commands.add_parser("results", help="show saved run records"); result.add_argument("id", nargs="?"); result.set_defaults(func=results)
+    history_parser = commands.add_parser("history", help="emit queue metadata, including denial records, as JSON")
+    history_parser.add_argument("id", nargs="?")
+    history_parser.set_defaults(func=history)
     config_parser = commands.add_parser("config", help="show or save non-secret Q&A settings")
     config_commands = config_parser.add_subparsers(dest="config_command", required=True)
     config_commands.add_parser("show", help="show effective non-secret Q&A settings").set_defaults(func=config_show)
