@@ -23,6 +23,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import unicodedata
 
 APP = "sudodeck"
 DEFAULT_ROOT = pathlib.Path.home() / ".local/share" / APP
@@ -318,16 +319,104 @@ def fields(item: dict) -> tuple[str, str, str, str]:
     return title, summary, affects, risks
 
 
+def terminal_width() -> int:
+    return max(1, shutil.get_terminal_size(fallback=(80, 24)).columns)
+
+
+def styled(value: str, role: str) -> str:
+    # Redirected output, dumb terminals, and NO_COLOR must remain plain text.
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ or os.environ.get("TERM", "dumb") == "dumb":
+        return value
+    codes = {"heading": "1", "muted": "2", "pending": "33", "success": "32",
+             "danger": "31", "running": "36"}
+    return f"\x1b[{codes[role]}m{value}\x1b[0m"
+
+
+def display_text(value: object) -> str:
+    # Metadata is untrusted. Keep terminal controls and bidi controls inert.
+    result = []
+    for char in str(value):
+        if char in "\n\r\t":
+            result.append(" ")
+        elif not char.isprintable():
+            result.append(ascii(char)[1:-1])
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def cell_width(value: str) -> int:
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in value)
+
+
+def wrapped(value: str, width: int | None = None, indent: str = "") -> str:
+    width = terminal_width() if width is None else max(1, width)
+    indent = indent if cell_width(indent) < width else ""
+    lines = []
+    line = ""
+    for word in display_text(value).split():
+        if line and cell_width(line + " " + word) <= width:
+            line += " " + word
+            continue
+        if line:
+            lines.append(line)
+            line = indent
+        for char in word:
+            if cell_width(line + char) > width and line != indent:
+                lines.append(line)
+                line = indent
+            line += char
+    if line:
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def display_date(value: object) -> str:
+    """Render an aware stored timestamp in the host's local timezone."""
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return f"{display_text(value)} (timezone unknown)"
+        local = parsed.astimezone()
+        offset = local.strftime("%z")
+        offset = offset[:3] + ":" + offset[3:]
+        clock = local.strftime("%I:%M:%S %p").lstrip("0")
+        return f"{local:%b} {local.day}, {local.year} at {clock} {local:%Z} (UTC{offset})"
+    except (ValueError, TypeError, OverflowError, OSError):
+        return f"{display_text(value)} (unrecognized date)"
+
+
+def status_text(item: dict) -> str:
+    label = execution_label(item)
+    state = label.split(",", 1)[0]
+    if state.startswith("PENDING"):
+        role = "pending"
+    elif state == "SUCCEEDED":
+        role = "success"
+    elif state == "RUNNING":
+        role = "running"
+    else:
+        role = "danger"
+    return styled(wrapped(f"[{display_text(label)}]"), role)
+
+
 def describe(item: dict, show_hash: bool = False) -> str:
     title, summary, affects, risks = fields(item)
-    details = f"ID: {item['id']}\nAdded: {item['created_at']}\nTitle: {title}\nSummary: {summary}\nAffects: {affects}\nRisks: {risks}\nArguments: {item.get('arguments', [])}"
+    details = [styled(wrapped(f"Title: {display_text(title)}"), "heading"),
+               status_text(item), "",
+               wrapped(f"ID: {display_text(item['id'])}"),
+               wrapped(f"Added: {display_date(item['created_at'])}"), ""]
+    for label, value in (("Summary", summary), ("Affects", affects), ("Risks", risks),
+                         ("Arguments", item.get("arguments", []))):
+        details.append(wrapped(f"{label}: {display_text(value)}", indent="  "))
     if show_hash:
-        details += f"\nSHA256: {item['sha256']}"
+        details.append(wrapped(f"SHA256: {display_text(item['sha256'])}"))
     denial = current_denial(item)
     if denial:
-        # JSON encoding keeps pasted terminal controls in untrusted reasons inert.
-        details += f"\nDenied: {denial['denied_at']} (revision {denial.get('revision', 0)})\nReason: {json.dumps(denial.get('reason', ''))}"
-    return details
+        details.extend(["", wrapped(f"Denied: {display_date(denial['denied_at'])} (revision {denial.get('revision', 0)})"),
+                        wrapped(f"Reason: {json.dumps(denial.get('reason', ''))}", indent="  ")])
+    return "\n".join(details)
 
 
 def show(item: dict, show_hash: bool = False) -> None:
@@ -654,7 +743,10 @@ def review_prompt(item: dict, configured_action: str) -> tuple[str, str | None]:
         supported = {"run": "r", "edit": "e", "ask": "a", "deny": "d", "quit": "q"}
     shortcut = supported.get(configured_action)
     label = configured_action.title() if shortcut else "No action"
-    return f"{choices} [Enter: {label}]: ", shortcut
+    hint = wrapped(choices)
+    default = wrapped(f"[Enter: {label}]")
+    role = "danger" if shortcut == "r" else "heading"
+    return f"{hint}\n{styled(default, role)}\n> ", shortcut
 
 
 def review(show_hash: bool = False, include_ran: bool = False, include_denied: bool = False) -> int:
@@ -663,9 +755,10 @@ def review(show_hash: bool = False, include_ran: bool = False, include_denied: b
         if not queued:
             print("No pending scripts. Use --include-ran for completed history or --include-denied to reconsider denied revisions.")
             return 0
-        for item in queued:
-            print("\n" + "=" * 72)
-            print(describe(item, show_hash) + f"\nState: {execution_label(item)}")
+        for index, item in enumerate(queued, 1):
+            print("\n" + styled(wrapped(f"SudoDeck / Review {index} of {len(queued)}"), "heading"))
+            print(styled("-" * min(terminal_width(), 72), "muted"))
+            print(describe(item, show_hash) + "\n")
             while True:
                 prompt, enter_action = review_prompt(item, default_action())
                 try:
@@ -706,10 +799,15 @@ def list_items(args: argparse.Namespace) -> int:
     if not listed:
         print("No pending scripts. Use --include-ran for execution history or --include-denied for denied revisions.")
         return 0
+    print(styled(wrapped(f"SudoDeck / {len(listed)} queued item{'s' if len(listed) != 1 else ''}"), "heading"))
     for item in listed:
-        title = fields(item)[0]
-        hash_part = f"  {item['sha256']}" if args.show_sha256 else ""
-        print(f"{item['id']}{hash_part}  [{execution_label(item)}]  {title}")
+        print()
+        print(status_text(item))
+        print(styled(wrapped(f"Title: {display_text(fields(item)[0])}"), "heading"))
+        print(wrapped(f"ID: {display_text(item['id'])}"))
+        print(wrapped(f"Added: {display_date(item['created_at'])}"))
+        if args.show_sha256:
+            print(wrapped(f"SHA256: {display_text(item['sha256'])}"))
     return 0
 
 

@@ -35,6 +35,18 @@ sudodeck config set-default-action run
 
 Completed items are hidden by default but retain private results/logs. Use `list --include-ran`, `results [ID]`, `history [ID]`, or `review --include-ran` for history and deliberate reruns. `list --include-denied --json`, `results ID`, and `history ID` expose denial records for tools and agents. Denial reasons are untrusted local data and are JSON-escaped, not approval or instructions. Output is not redacted and may contain secrets.
 
+## Terminal display
+
+Review and list show the title, a text status, and the full queue ID. Added dates
+use the host's local timezone with its abbreviation and numeric UTC offset.
+Metadata and action hints wrap to the terminal width. Color is limited to
+interactive terminals; `NO_COLOR` or `TERM=dumb` disables it. Redirected output
+is plain text. `list --json`, `history`, and `results` retain their stored UTC
+timestamps and metadata format.
+
+The review keys and Enter default retain the same behavior. The action hints
+show the available keys and the resolved Enter action on separate lines.
+
 ## Q&A harnesses
 
 At `a`, select a backend or accept the saved default. Q&A output is display-only data, never approval or menu input.
@@ -69,4 +81,6 @@ The bundled skill is [`.agents/skills/sudodeck/SKILL.md`](.agents/skills/sudodec
 ```sh
 ./tests/run.sh
 python3 -m py_compile sudodeck.py
+# Presentation checks only; never execute a queued script:
+python3 tests/presentation.py
 ```
