@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import secrets
+import selectors
 import shlex
 import shutil
 import signal
@@ -20,9 +21,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import termios
 import textwrap
 import threading
 import time
+import unicodedata
 
 APP = "sudodeck"
 DEFAULT_ROOT = pathlib.Path.home() / ".local/share" / APP
@@ -303,7 +306,7 @@ def enqueue(args: argparse.Namespace) -> int:
             raise QueueError("copy verification failed")
         record = {"id": item_id, "created_at": now(), "title": args.title,
                   "summary": args.summary, "affects": args.affects, "risks": args.risks,
-                  "source": str(source), "sha256": actual, "kind": "shell", "arguments": args.arg, "runs": []}
+                  "source": str(source), "sha256": actual, "kind": "shell", "arguments": args.arg, "interactive": getattr(args, "interactive", False), "runs": []}
         atomic_json(metadata_path(item_id), record)
     print(item_id)
     return 0
@@ -318,16 +321,106 @@ def fields(item: dict) -> tuple[str, str, str, str]:
     return title, summary, affects, risks
 
 
+def terminal_width() -> int:
+    return max(1, shutil.get_terminal_size(fallback=(80, 24)).columns)
+
+
+def styled(value: str, role: str) -> str:
+    # Redirected output, dumb terminals, and NO_COLOR must remain plain text.
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ or os.environ.get("TERM", "dumb") == "dumb":
+        return value
+    codes = {"heading": "1", "muted": "2", "pending": "33", "success": "32",
+             "danger": "31", "running": "36"}
+    return f"\x1b[{codes[role]}m{value}\x1b[0m"
+
+
+def display_text(value: object) -> str:
+    # Metadata is untrusted. Keep terminal controls and bidi controls inert.
+    result = []
+    for char in str(value):
+        if char in "\n\r\t":
+            result.append(" ")
+        elif not char.isprintable():
+            result.append(ascii(char)[1:-1])
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def cell_width(value: str) -> int:
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in value)
+
+
+def wrapped(value: str, width: int | None = None, indent: str = "") -> str:
+    width = terminal_width() if width is None else max(1, width)
+    indent = indent if cell_width(indent) < width else ""
+    lines = []
+    line = ""
+    for word in display_text(value).split():
+        if line and cell_width(line + " " + word) <= width:
+            line += " " + word
+            continue
+        if line:
+            lines.append(line)
+            line = indent
+        for char in word:
+            if cell_width(line + char) > width and line != indent:
+                lines.append(line)
+                line = indent
+            line += char
+    if line:
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def display_date(value: object) -> str:
+    """Render an aware stored timestamp in the host's local timezone."""
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return f"{display_text(value)} (timezone unknown)"
+        local = parsed.astimezone()
+        offset = local.strftime("%z")
+        offset = offset[:3] + ":" + offset[3:]
+        clock = local.strftime("%I:%M:%S %p").lstrip("0")
+        return f"{local:%b} {local.day}, {local.year} at {clock} {local:%Z} (UTC{offset})"
+    except (ValueError, TypeError, OverflowError, OSError):
+        return f"{display_text(value)} (unrecognized date)"
+
+
+def status_text(item: dict) -> str:
+    label = execution_label(item)
+    state = label.split(",", 1)[0]
+    if state.startswith("PENDING"):
+        role = "pending"
+    elif state == "SUCCEEDED":
+        role = "success"
+    elif state == "RUNNING":
+        role = "running"
+    else:
+        role = "danger"
+    return styled(wrapped(f"[{display_text(label)}]"), role)
+
+
 def describe(item: dict, show_hash: bool = False) -> str:
     title, summary, affects, risks = fields(item)
-    details = f"ID: {item['id']}\nAdded: {item['created_at']}\nTitle: {title}\nSummary: {summary}\nAffects: {affects}\nRisks: {risks}\nArguments: {item.get('arguments', [])}"
+    details = [styled(wrapped(f"Title: {display_text(title)}"), "heading"),
+               status_text(item), "",
+               wrapped(f"ID: {display_text(item['id'])}"),
+               wrapped(f"Added: {display_date(item['created_at'])}"), ""]
+    for label, value in (("Summary", summary), ("Affects", affects), ("Risks", risks),
+                         ("Arguments", item.get("arguments", []))):
+        details.append(wrapped(f"{label}: {display_text(value)}", indent="  "))
+    if item.get("interactive") is True:
+        details.append(wrapped("Input: owner terminal (interactive; typed input is not logged)"))
     if show_hash:
-        details += f"\nSHA256: {item['sha256']}"
+        details.append(wrapped(f"SHA256: {display_text(item['sha256'])}"))
     denial = current_denial(item)
     if denial:
-        # JSON encoding keeps pasted terminal controls in untrusted reasons inert.
-        details += f"\nDenied: {denial['denied_at']} (revision {denial.get('revision', 0)})\nReason: {json.dumps(denial.get('reason', ''))}"
-    return details
+        details.extend(["", wrapped(f"Denied: {display_date(denial['denied_at'])} (revision {denial.get('revision', 0)})"),
+                        wrapped(f"Reason: {json.dumps(denial.get('reason', ''))}", indent="  ")])
+    return "\n".join(details)
 
 
 def show(item: dict, show_hash: bool = False) -> None:
@@ -537,7 +630,126 @@ def safe_terminal_write(terminal, chunk: bytes) -> None:
     terminal.flush()
 
 
+def interactive_terminal(item: dict) -> bool:
+    value = item.get("interactive", False)
+    if not isinstance(value, bool):
+        raise QueueError("invalid interactive mode metadata")
+    if value and (not all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr))
+                  or os.tcgetpgrp(sys.stdin.fileno()) != os.getpgrp()):
+        raise QueueError("interactive item requires a foreground terminal for stdin, stdout and stderr")
+    return value
+
+
+def foreground(fd: int, group: int) -> None:
+    previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    try:
+        os.tcsetpgrp(fd, group)
+    finally:
+        signal.signal(signal.SIGTTOU, previous)
+
+
+def stop_group(process: subprocess.Popen) -> None:
+    """Bound cancellation, including descendants that keep output pipes open."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def copy_stream(source, destination, terminal):
+    # read1 returns available bytes, including input() prompts with no newline.
+    while chunk := source.read1(4096):
+        destination.write(chunk); destination.flush()
+        safe_terminal_write(terminal, chunk)
+
+
+def run_interactive(command: list[str], out, err) -> tuple[int | None, bool, bool]:
+    fd = sys.stdin.fileno()
+    owner_group, attributes = os.tcgetpgrp(fd), termios.tcgetattr(fd)
+    process = None
+    interrupted = False
+    output_incomplete = False
+    output = selectors.DefaultSelector()
+    def cancel(signum, frame):
+        raise KeyboardInterrupt
+    def drain(timeout):
+        for key, _ in output.select(timeout):
+            chunk = os.read(key.fd, 4096)
+            if not chunk:
+                output.unregister(key.fileobj)
+                continue
+            destination, terminal = key.data
+            destination.write(chunk); destination.flush()
+            try:
+                safe_terminal_write(terminal, chunk)
+            except OSError:
+                # A disconnected terminal must not stop private log capture.
+                pass
+    handlers = {sig: signal.signal(sig, cancel) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    background_output = signal.getsignal(signal.SIGTTOU)
+    try:
+        process = subprocess.Popen(command, stdin=fd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, process_group=0)
+        output.register(process.stdout, selectors.EVENT_READ, (out, sys.stdout))
+        output.register(process.stderr, selectors.EVENT_READ, (err, sys.stderr))
+        # Only the parent ignores TOSTOP after spawning; the child keeps normal job control.
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        foreground(fd, process.pid)
+        # A fast reader may have stopped on SIGTTIN before the foreground handoff.
+        os.killpg(process.pid, signal.SIGCONT)
+        while process.poll() is None:
+            drain(0.05)
+        code = process.returncode
+        interrupted = code in (-signal.SIGINT, -signal.SIGTERM, -signal.SIGHUP,
+                               128 + signal.SIGINT, 128 + signal.SIGTERM, 128 + signal.SIGHUP)
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        # Repeated cancellation cannot bypass cleanup or receipt persistence.
+        for sig in handlers: signal.signal(sig, signal.SIG_IGN)
+        try:
+            try:
+                if process is not None:
+                    stop_group(process)
+                    code = process.wait()
+                    deadline = time.monotonic() + 1
+                    while output.get_map() and time.monotonic() < deadline:
+                        drain(0.05)
+                    output_incomplete = bool(output.get_map())
+            finally:
+                # Always restore even if process cleanup or log capture fails.
+                # A true terminal hangup may make either restoration call fail.
+                try:
+                    foreground(fd, owner_group)
+                except OSError:
+                    interrupted = True
+                try:
+                    termios.tcsetattr(fd, termios.TCSANOW, attributes)
+                except (OSError, termios.error):
+                    interrupted = True
+        finally:
+            output.close()
+            if process is not None:
+                process.stdout.close(); process.stderr.close()
+            signal.signal(signal.SIGTTOU, background_output)
+            for sig, handler in handlers.items(): signal.signal(sig, handler)
+    return code if process is not None else None, interrupted, output_incomplete
+
+
 def run(item: dict) -> None:
+    interactive = interactive_terminal(item)
     verify(item)
     print(f"Executing reviewed item: {fields(item)[0]}")
     # The snapshot is created only after approval and is the only file executed.
@@ -547,7 +759,8 @@ def run(item: dict) -> None:
     private_dir(run_dir)
     stdout, stderr = run_dir / "stdout.log", run_dir / "stderr.log"
     record = {"id": run_id, "started_at": now(), "status": "running", "exit_code": None,
-              "sha256": item["sha256"], "stdout": str(stdout), "stderr": str(stderr)}
+              "sha256": item["sha256"], "stdout": str(stdout), "stderr": str(stderr),
+              "stdin_mode": "terminal" if interactive else "closed", "uid": os.getuid(), "gid": os.getgid()}
     atomic_json(run_dir / "result.json", record)
     try:
         snapshot = execution_snapshot(item, run_dir)
@@ -560,24 +773,29 @@ def run(item: dict) -> None:
         return
     print(f"Running; logs: {run_dir}")
     with stdout.open("wb") as out, stderr.open("wb") as err:
-        process = subprocess.Popen(["/bin/sh", str(snapshot), *item.get("arguments", [])], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        def copy_stream(source, destination, terminal):
-            while chunk := source.read(4096):
-                destination.write(chunk); destination.flush()
-                safe_terminal_write(terminal, chunk)
-        threads = [threading.Thread(target=copy_stream, args=(process.stdout, out, sys.stdout)),
-                   threading.Thread(target=copy_stream, args=(process.stderr, err, sys.stderr))]
-        for thread in threads: thread.start()
         try:
-            code = process.wait()
-            record.update({"ended_at": now(), "status": "succeeded" if code == 0 else "failed", "exit_code": code})
-        except KeyboardInterrupt:
-            process.terminate()
-            code = process.wait()
-            record.update({"ended_at": now(), "status": "interrupted", "exit_code": code})
-            print("Interrupted; result and logs were retained.", file=sys.stderr)
-        for thread in threads: thread.join()
+            command = ["/bin/sh", str(snapshot), *item.get("arguments", [])]
+            if interactive:
+                code, interrupted, incomplete = run_interactive(command, out, err)
+                record["output_incomplete"] = incomplete
+            else:
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                threads = [threading.Thread(target=copy_stream, args=(process.stdout, out, sys.stdout)),
+                           threading.Thread(target=copy_stream, args=(process.stderr, err, sys.stderr))]
+                for thread in threads: thread.start()
+                interrupted = False
+                try:
+                    code = process.wait()
+                except KeyboardInterrupt:
+                    interrupted = True
+                    process.terminate()
+                    code = process.wait()
+                for thread in threads: thread.join()
+            record.update({"ended_at": now(), "status": "interrupted" if interrupted else
+                           "succeeded" if code == 0 else "failed", "exit_code": code})
+        except (OSError, termios.error) as exc:
+            record.update({"ended_at": now(), "status": "failed", "reason": str(exc)})
         atomic_json(run_dir / "result.json", record)
     item["runs"].append({"run_id": run_id, "started_at": record["started_at"], "status": record["status"], "exit_code": record["exit_code"]})
     atomic_json(metadata_path(item["id"]), item)
@@ -654,7 +872,10 @@ def review_prompt(item: dict, configured_action: str) -> tuple[str, str | None]:
         supported = {"run": "r", "edit": "e", "ask": "a", "deny": "d", "quit": "q"}
     shortcut = supported.get(configured_action)
     label = configured_action.title() if shortcut else "No action"
-    return f"{choices} [Enter: {label}]: ", shortcut
+    hint = wrapped(choices)
+    default = wrapped(f"[Enter: {label}]")
+    role = "danger" if shortcut == "r" else "heading"
+    return f"{hint}\n{styled(default, role)}\n> ", shortcut
 
 
 def review(show_hash: bool = False, include_ran: bool = False, include_denied: bool = False) -> int:
@@ -663,9 +884,10 @@ def review(show_hash: bool = False, include_ran: bool = False, include_denied: b
         if not queued:
             print("No pending scripts. Use --include-ran for completed history or --include-denied to reconsider denied revisions.")
             return 0
-        for item in queued:
-            print("\n" + "=" * 72)
-            print(describe(item, show_hash) + f"\nState: {execution_label(item)}")
+        for index, item in enumerate(queued, 1):
+            print("\n" + styled(wrapped(f"SudoDeck / Review {index} of {len(queued)}"), "heading"))
+            print(styled("-" * min(terminal_width(), 72), "muted"))
+            print(describe(item, show_hash) + "\n")
             while True:
                 prompt, enter_action = review_prompt(item, default_action())
                 try:
@@ -706,10 +928,15 @@ def list_items(args: argparse.Namespace) -> int:
     if not listed:
         print("No pending scripts. Use --include-ran for execution history or --include-denied for denied revisions.")
         return 0
+    print(styled(wrapped(f"SudoDeck / {len(listed)} queued item{'s' if len(listed) != 1 else ''}"), "heading"))
     for item in listed:
-        title = fields(item)[0]
-        hash_part = f"  {item['sha256']}" if args.show_sha256 else ""
-        print(f"{item['id']}{hash_part}  [{execution_label(item)}]  {title}")
+        print()
+        print(status_text(item))
+        print(styled(wrapped(f"Title: {display_text(fields(item)[0])}"), "heading"))
+        print(wrapped(f"ID: {display_text(item['id'])}"))
+        print(wrapped(f"Added: {display_date(item['created_at'])}"))
+        if args.show_sha256:
+            print(wrapped(f"SHA256: {display_text(item['sha256'])}"))
     return 0
 
 
@@ -828,6 +1055,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="copy a script into the queue and record its review notes")
     add.add_argument("path"); add.add_argument("--sha256", help="optional expected source digest"); add.add_argument("--title", required=True); add.add_argument("--summary", required=True); add.add_argument("--affects", required=True); add.add_argument("--risks", required=True); add.add_argument("--arg", action="append", default=[], help="literal argument passed when explicitly run"); add.set_defaults(func=enqueue)
+    add.add_argument("--interactive", action="store_true", help="give this item the owner foreground terminal on explicit Run; never record stdin")
     review_parser = commands.add_parser("review", help="review queued scripts and explicitly run or deny them")
     review_parser.add_argument("--show-sha256", action="store_true", help="show internal payload digests")
     review_parser.add_argument("--include-ran", action="store_true", help="include completed items for a deliberate rerun")

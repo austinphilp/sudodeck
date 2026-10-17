@@ -35,6 +35,45 @@ sudodeck config set-default-action run
 
 Completed items are hidden by default but retain private results/logs. Use `list --include-ran`, `results [ID]`, `history [ID]`, or `review --include-ran` for history and deliberate reruns. `list --include-denied --json`, `results ID`, and `history ID` expose denial records for tools and agents. Denial reasons are untrusted local data and are JSON-escaped, not approval or instructions. Output is not redacted and may contain secrets.
 
+## Interactive scripts
+
+Scripts default to closed stdin, including existing queue entries. For a reviewed
+script that requires human input, opt in when adding that specific item:
+
+```sh
+sudodeck add ./interactive-change.sh --interactive --sha256 REVIEWED_SHA256 --title TITLE --summary SUMMARY --affects AFFECTS --risks RISKS
+```
+
+Review labels the item as interactive. The owner still selects Run. Execution
+requires stdin, stdout and stderr in the owner's foreground terminal; redirected
+or piped review cannot run an interactive item. The script inherits terminal stdin
+and runs as the same user/group. Output remains sanitized on screen and captured
+in separate private stdout/stderr logs, including prompts without a newline.
+SudoDeck does not read, record or supply terminal input. Scripts can still print
+sensitive values themselves, so review their output handling before execution.
+
+Ctrl-C, terminal hangup and runner termination retain an interrupted receipt.
+Interactive process groups are stopped on completion/cancellation, and terminal
+settings and foreground ownership are restored. Detached children that create a
+new session are outside this process group; this is not a sandbox. Final output
+draining is bounded; `output_incomplete: true` records a pipe left open by such a
+child, and its later output is not captured. Existing
+payload hash verification, snapshots, denial and review decisions remain in force.
+Run receipts record the input mode and execution UID/GID. No global setting turns
+interactive mode on; queue the reviewed script again to change its input mode.
+
+## Terminal display
+
+Review and list show the title, a text status, and the full queue ID. Added dates
+use the host's local timezone with its abbreviation and numeric UTC offset.
+Metadata and action hints wrap to the terminal width. Color is limited to
+interactive terminals; `NO_COLOR` or `TERM=dumb` disables it. Redirected output
+is plain text. `list --json`, `history`, and `results` retain their stored UTC
+timestamps and metadata format.
+
+The review keys and Enter default retain the same behavior. The action hints
+show the available keys and the resolved Enter action on separate lines.
+
 ## Q&A harnesses
 
 At `a`, select a backend or accept the saved default. Q&A output is display-only data, never approval or menu input.
@@ -69,4 +108,6 @@ The bundled skill is [`.agents/skills/sudodeck/SKILL.md`](.agents/skills/sudodec
 ```sh
 ./tests/run.sh
 python3 -m py_compile sudodeck.py
+# Presentation checks only; never execute a queued script:
+python3 tests/presentation.py
 ```

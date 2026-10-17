@@ -6,6 +6,7 @@ cd "$root"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 export SUDODECK_HOME="$work/queue"
+export SUDODECK_CONFIG="$work/config.json"
 
 printf '#!/bin/sh\necho hello-test\necho stderr-test >&2\n' > "$work/fixture.sh"
 chmod 700 "$work/fixture.sh"
@@ -59,7 +60,7 @@ python3 "$root/sudodeck.py" config set-default-action none >/dev/null
 python3 "$root/sudodeck.py" list > "$work/post-run-list.out"
 if grep -q 'Harmless fixture' "$work/post-run-list.out"; then exit 1; fi
 python3 "$root/sudodeck.py" list --include-ran > "$work/history-list.out"
-grep -q '\[SUCCEEDED, exit 0\].*Harmless fixture' "$work/history-list.out"
+grep -A1 '\[SUCCEEDED, exit 0\]' "$work/history-list.out" | grep -q 'Title: Harmless fixture'
 
 printf '#!/bin/sh\necho must-not-run\n' > "$work/deny.sh"
 chmod 700 "$work/deny.sh"
@@ -72,7 +73,7 @@ if grep -q 'Denied fixture' "$work/denied-default-list.out"; then exit 1; fi
 printf 'q\n' | python3 "$root/sudodeck.py" review > "$work/denied-default-review.out"
 if grep -q 'Denied fixture' "$work/denied-default-review.out"; then exit 1; fi
 python3 "$root/sudodeck.py" list --include-denied > "$work/denied-list.out"
-grep -q '\[DENIED\].*Denied fixture' "$work/denied-list.out"
+grep -A1 '\[DENIED\]' "$work/denied-list.out" | grep -q 'Title: Denied fixture'
 python3 "$root/sudodeck.py" list --include-denied --json > "$work/denied-list.json"
 python3 "$root/sudodeck.py" results "$denied_id" > "$work/denied-results.json"
 python3 "$root/sudodeck.py" history "$denied_id" > "$work/denied-history.json"
@@ -120,7 +121,7 @@ grep -q '"exit_code": 7' "$failure_result"
 python3 "$root/sudodeck.py" list > "$work/pending-after-failure.out"
 if grep -q 'Failure fixture' "$work/pending-after-failure.out"; then exit 1; fi
 python3 "$root/sudodeck.py" list --include-ran > "$work/history-after-failure.out"
-grep -q '\[FAILED, exit 7\].*Failure fixture' "$work/history-after-failure.out"
+grep -A1 '\[FAILED, exit 7\]' "$work/history-after-failure.out" | grep -q 'Title: Failure fixture'
 printf 'q\n' | python3 "$root/sudodeck.py" review --include-ran > "$work/rerun-menu.out"
 grep -q '\[r\]erun' "$work/rerun-menu.out"
 
@@ -131,5 +132,7 @@ grep -q 'payload changed for' "$work/tamper.err"
 
 python3 tests/qa_adapters.py
 python3 tests/edit_review.py
+python3 tests/presentation.py
+python3 tests/interactive.py
 
 echo 'SudoDeck tests passed'
