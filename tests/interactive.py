@@ -346,5 +346,75 @@ print("detached-holder-started", flush=True)
         self.assertIs(record["output_incomplete"], True)
 
 
+    def test_log_write_failure_restores_terminal_and_saves_failed_receipt(self):
+        item_id = self.python_fixture("""import sys, termios, time
+settings = termios.tcgetattr(0)
+settings[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, settings)
+sys.stdout.write('x' * 20000); sys.stdout.flush()
+time.sleep(30)
+""")
+        launcher = """import errno, pathlib, runpy, sys
+original = pathlib.Path.open
+class FailingLog:
+    def __init__(self, handle): self.handle = handle
+    def __enter__(self): return self
+    def __exit__(self, *args): return self.handle.__exit__(*args)
+    def write(self, chunk): raise OSError(errno.ENOSPC, 'fixture log device full')
+    def flush(self): self.handle.flush()
+def patched(path, *args, **kwargs):
+    handle = original(path, *args, **kwargs)
+    return FailingLog(handle) if path.name == 'stdout.log' and args == ('wb',) else handle
+pathlib.Path.open = patched
+sys.argv = [%r, 'review']
+runpy.run_path(%r, run_name='__main__')
+""" % (str(APP), str(APP))
+        terminal = self.terminal([sys.executable, "-c", launcher])
+        terminal.send(b"r\n")
+        self.assertEqual(terminal.finish(), 0)
+        self.assertEqual(termios.tcgetattr(terminal.fd), terminal.initial_attributes)
+        _, record = self.assert_audit(item_id, "failed")
+        self.assertIn("fixture log device full", record["reason"])
+
+    def test_final_receipt_failure_is_uncertain_and_cannot_auto_rerun(self):
+        marker = self.work / "execution-count"
+        item_id = self.python_fixture(r"""import pathlib, sys, termios
+settings = termios.tcgetattr(0)
+settings[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, settings)
+with pathlib.Path(sys.argv[1]).open('a') as handle:
+    handle.write('one execution\n')
+print('fixture-finished', flush=True)
+""", arguments=(str(marker),))
+        launcher = """import errno, json, os, pathlib, runpy, sys
+original = os.replace
+def patched(source, destination):
+    if pathlib.Path(destination).name == 'result.json':
+        record = json.loads(pathlib.Path(source).read_text())
+        if record.get('status') != 'running':
+            raise OSError(errno.ENOSPC, 'fixture receipt device full')
+    return original(source, destination)
+os.replace = patched
+sys.argv = [%r, 'review']
+runpy.run_path(%r, run_name='__main__')
+""" % (str(APP), str(APP))
+        terminal = self.terminal([sys.executable, "-c", launcher])
+        terminal.send(b"r\n")
+        self.assertNotEqual(terminal.finish(), 0)
+        self.assertEqual(termios.tcgetattr(terminal.fd), terminal.initial_attributes)
+        self.assertIn(b"fixture-finished", terminal.output)
+        self.assertIn(b"fixture receipt device full", terminal.output)
+        self.assertNotIn(b"succeeded (exit", terminal.output)
+        self.assertNotIn(b"stdout/stderr saved", terminal.output)
+        _, record = self.receipt(item_id)
+        self.assertEqual(record["status"], "running")
+        self.assertNotIn("ended_at", record)
+        result = self.cli("review", input="r\nq\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("run in progress", result.stdout)
+        self.receipt(item_id)  # Still exactly one uncertain run, not a retry.
+        self.assertEqual(marker.read_text(), "one execution\n")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

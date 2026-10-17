@@ -720,22 +720,25 @@ def run_interactive(command: list[str], out, err) -> tuple[int | None, bool, boo
         # Repeated cancellation cannot bypass cleanup or receipt persistence.
         for sig in handlers: signal.signal(sig, signal.SIG_IGN)
         try:
-            if process is not None:
-                stop_group(process)
-                code = process.wait()
-                deadline = time.monotonic() + 1
-                while output.get_map() and time.monotonic() < deadline:
-                    drain(0.05)
-                output_incomplete = bool(output.get_map())
-            # A true terminal hangup may make either restoration call fail.
             try:
-                foreground(fd, owner_group)
-            except OSError:
-                interrupted = True
-            try:
-                termios.tcsetattr(fd, termios.TCSANOW, attributes)
-            except (OSError, termios.error):
-                interrupted = True
+                if process is not None:
+                    stop_group(process)
+                    code = process.wait()
+                    deadline = time.monotonic() + 1
+                    while output.get_map() and time.monotonic() < deadline:
+                        drain(0.05)
+                    output_incomplete = bool(output.get_map())
+            finally:
+                # Always restore even if process cleanup or log capture fails.
+                # A true terminal hangup may make either restoration call fail.
+                try:
+                    foreground(fd, owner_group)
+                except OSError:
+                    interrupted = True
+                try:
+                    termios.tcsetattr(fd, termios.TCSANOW, attributes)
+                except (OSError, termios.error):
+                    interrupted = True
         finally:
             output.close()
             if process is not None:
