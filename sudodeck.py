@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import secrets
 import selectors
 import shlex
@@ -40,6 +41,21 @@ LOCK = ROOT / ".lock"
 CONFIG = pathlib.Path(os.environ.get("SUDODECK_CONFIG", os.environ.get("SCRIPTDECK_CONFIG", DEFAULT_CONFIG)))
 BACKENDS = {"codex", "pi", "claude", "opencode"}
 DEFAULT_ACTIONS = {"none", "run", "edit", "ask", "deny", "quit"}
+# Exact re-auth messages from the Google Cloud SDK (googlecloudsdk/core/credentials/
+# exceptions.py) and its vendored google-auth (google/auth/exceptions.py,
+# google/oauth2/reauth.py, google/oauth2/challenges.py). A failed run whose output
+# matches one stays pending so the owner can log in and run it again.
+# Group 1, when present, is the login command the message names.
+GCLOUD_REAUTH_SIGNATURES = tuple(re.compile(pattern) for pattern in (
+    # gcloud/bq "Please run:\n\n  $ gcloud auth login\n\nto obtain new credentials."
+    r"\$ (gcloud auth (?:application-default )?login)\s+to (?:obtain new credentials|complete reauthentication)",
+    r"Reauthentication is needed\. Please run `(gcloud auth application-default login)` to reauthenticate",
+    r"Please run `(gcloud auth login)` to complete reauthentication with SAML",
+    r"Reauthentication failed\. cannot prompt during non-interactive execution",
+    # google-auth RefreshError "invalid_grant: <Google error_description>".
+    r"invalid_grant\W+(?:Token has been expired or revoked|reauth related error \(invalid_rapt\))",
+))
+REAUTH_SCAN_BYTES = 64 * 1024
 
 
 class QueueError(RuntimeError):
@@ -246,10 +262,23 @@ def is_denied(item: dict) -> bool:
     return current_denial(item) is not None
 
 
+def reauth_retry(record: dict | None) -> dict | None:
+    value = record.get("gcloud_reauth_required") if record else None
+    return value if isinstance(value, dict) else None
+
+
+def pending_reauth(item: dict) -> dict | None:
+    """Return the re-auth note when the current revision's last run failed on gcloud auth."""
+    record = latest_execution(item)
+    return reauth_retry(record) if record and record.get("sha256") == item.get("sha256") else None
+
+
 def is_completed(item: dict) -> bool:
     record = latest_execution(item)
-    # A successful old run does not complete a subsequently edited payload.
-    return bool(record and record.get("status") != "running" and record.get("sha256") == item.get("sha256"))
+    # A successful old run does not complete a subsequently edited payload, and a
+    # gcloud re-auth failure leaves the item pending for a manual retry.
+    return bool(record and record.get("status") != "running" and record.get("sha256") == item.get("sha256")
+                and not reauth_retry(record))
 
 
 def execution_label(item: dict) -> str:
@@ -264,7 +293,33 @@ def execution_label(item: dict) -> str:
     suffix = f", exit {code}" if code is not None else ""
     if record.get("sha256") != item.get("sha256"):
         return f"PENDING REVISION (last {status}{suffix})"
+    if reauth_retry(record):
+        return f"PENDING RETRY (last {status}{suffix}, gcloud re-auth needed)"
     return f"{status}{suffix}"
+
+
+def reauth_hint(command: str | None) -> str:
+    login = f"`{command}`" if command else \
+        "`gcloud auth login` (or `gcloud auth application-default login` for application-default credentials)"
+    return f"Google Cloud credentials need re-authentication. Run {login}, then run this item again from sudodeck review."
+
+
+def detect_gcloud_reauth(logs: tuple[pathlib.Path, ...]) -> dict | None:
+    """Match only known gcloud/google-auth re-auth messages near the end of a run's logs."""
+    matched, command = False, None
+    for log in logs:
+        try:
+            with log.open("rb") as handle:
+                handle.seek(max(0, handle.seek(0, os.SEEK_END) - REAUTH_SCAN_BYTES))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for signature in GCLOUD_REAUTH_SIGNATURES:
+            found = signature.search(text)
+            if found:
+                matched = True
+                command = command or (found.group(1) if signature.groups else None)
+    return {"login_command": command, "hint": reauth_hint(command)} if matched else None
 
 
 def verify(item: dict) -> pathlib.Path:
@@ -416,6 +471,9 @@ def describe(item: dict, show_hash: bool = False) -> str:
         details.append(wrapped("Input: owner terminal (interactive; typed input is not logged)"))
     if show_hash:
         details.append(wrapped(f"SHA256: {display_text(item['sha256'])}"))
+    reauth = pending_reauth(item)
+    if reauth:
+        details.extend(["", wrapped(f"Last attempt: {reauth_hint(reauth.get('login_command'))}", indent="  ")])
     denial = current_denial(item)
     if denial:
         details.extend(["", wrapped(f"Denied: {display_date(denial['denied_at'])} (revision {denial.get('revision', 0)})"),
@@ -796,10 +854,18 @@ def run(item: dict) -> None:
                            "succeeded" if code == 0 else "failed", "exit_code": code})
         except (OSError, termios.error) as exc:
             record.update({"ended_at": now(), "status": "failed", "reason": str(exc)})
+        reauth = detect_gcloud_reauth((stderr, stdout)) if record["status"] == "failed" and record["exit_code"] else None
+        if reauth:
+            record["gcloud_reauth_required"] = reauth
         atomic_json(run_dir / "result.json", record)
-    item["runs"].append({"run_id": run_id, "started_at": record["started_at"], "status": record["status"], "exit_code": record["exit_code"]})
+    summary = {"run_id": run_id, "started_at": record["started_at"], "status": record["status"], "exit_code": record["exit_code"]}
+    if reauth:
+        summary["gcloud_reauth_required"] = reauth
+    item["runs"].append(summary)
     atomic_json(metadata_path(item["id"]), item)
     print(f"{record['status']} (exit {record['exit_code']}); stdout/stderr saved in {run_dir}")
+    if reauth:
+        print(f"Kept pending. {reauth['hint']}")
 
 
 def deny(item: dict) -> None:
@@ -937,6 +1003,9 @@ def list_items(args: argparse.Namespace) -> int:
         print(wrapped(f"Added: {display_date(item['created_at'])}"))
         if args.show_sha256:
             print(wrapped(f"SHA256: {display_text(item['sha256'])}"))
+        reauth = pending_reauth(item)
+        if reauth:
+            print(wrapped(f"Last attempt: {reauth_hint(reauth.get('login_command'))}", indent="  "))
     return 0
 
 

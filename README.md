@@ -35,6 +35,20 @@ sudodeck config set-default-action run
 
 Completed items are hidden by default but retain private results/logs. Use `list --include-ran`, `results [ID]`, `history [ID]`, or `review --include-ran` for history and deliberate reruns. `list --include-denied --json`, `results ID`, and `history ID` expose denial records for tools and agents. Denial reasons are untrusted local data and are JSON-escaped, not approval or instructions. Output is not redacted and may contain secrets.
 
+## Retry after gcloud re-authentication
+
+A run that fails because Google Cloud credentials need re-authentication stays pending. Re-authenticate, then run the item again from review. SudoDeck never reruns it automatically. The failed run record and its logs stay in history as usual.
+
+SudoDeck checks the last 64 KiB of the failed run's stdout and stderr for these Google Cloud SDK and google-auth messages:
+
+- The gcloud and `bq` advice `$ gcloud auth login` or `$ gcloud auth application-default login`, followed by `to obtain new credentials` or `to complete reauthentication`.
+- ``Reauthentication is needed. Please run `gcloud auth application-default login` to reauthenticate``.
+- ``Please run `gcloud auth login` to complete reauthentication with SAML``.
+- `Reauthentication failed. cannot prompt during non-interactive execution`.
+- `invalid_grant` with `Token has been expired or revoked` or `reauth related error (invalid_rapt)`.
+
+Only a run with status `failed` and a nonzero exit code is checked. Successful and interrupted runs, and failures without one of these messages, complete as before. Review and `list` show `PENDING RETRY (last FAILED, exit N, gcloud re-auth needed)` and a `Last attempt:` line that names the login command when the output names one. The run record in `results ID`, and its summary in `list --json` and `history`, carry `gcloud_reauth_required` with `login_command` (or `null`) and `hint`.
+
 ## Interactive scripts
 
 Scripts default to closed stdin, including existing queue entries. For a reviewed

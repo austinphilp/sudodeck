@@ -134,5 +134,6 @@ python3 tests/qa_adapters.py
 python3 tests/edit_review.py
 python3 tests/presentation.py
 python3 tests/interactive.py
+python3 tests/auth_retry.py
 
 echo 'SudoDeck tests passed'
