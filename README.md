@@ -46,11 +46,11 @@ SudoDeck checks the last 64 KiB of the failed run's stdout and stderr for these 
 - ``Reauthentication is needed. Please run `gcloud auth application-default login` to reauthenticate``.
 - ``Please run `gcloud auth login` to complete reauthentication with SAML``.
 - `Reauthentication failed. cannot prompt during non-interactive execution`.
-- `invalid_grant` with `Token has been expired or revoked` or `reauth related error (invalid_rapt)`.
+- gcloud's `There was a problem refreshing ... auth tokens:` followed on the same line by `invalid_grant` with `Token has been expired or revoked` or `reauth related error (invalid_rapt)`. Other Google OAuth clients print the same `invalid_grant` text for their own refresh tokens, so it does not match without the gcloud prefix.
 
-gcloud adds `Please run: $ gcloud auth login ... to obtain new credentials` to every token refresh failure, including transient and permission errors. That advice alone does not keep an item pending. SudoDeck uses it only to name the login command for a run that matched one of the messages above.
+gcloud adds `Please run: $ gcloud auth login ... to obtain new credentials` to most token refresh failures, including transient and permission errors. That advice alone does not keep an item pending. SudoDeck uses it only to name the login command for a run that matched one of the messages above.
 
-Only a run with status `failed` and a nonzero exit code is checked. Successful and interrupted runs, and failures without one of these messages, complete as before. Review and `list` show `PENDING RETRY (last FAILED, exit N, gcloud re-auth needed)` and a `Last attempt:` line that names the login command when the output names one. The run record in `results ID`, and its summary in `list --json` and `history`, carry `gcloud_reauth_required` with `login_command` (or `null`), `hint`, and the `sha256` of the revision that failed. The item stays pending only while that digest matches the item's current `sha256` and the revision is not denied.
+Only a run with status `failed` and a nonzero exit code is checked. Successful and interrupted runs, and failures without one of these messages, complete as before. Review and `list` show `PENDING RETRY (last FAILED, exit N, gcloud re-auth needed)` and a `Last attempt:` line that names the login command when the output names one. The run record in `results ID`, and its summary in `list --json` and `history`, carry `gcloud_reauth_required` with `login_command` (or `null`), `hint`, and the `sha256` of the revision that failed. The re-auth note applies only while that digest matches the item's current `sha256` and the revision is not denied. An edited revision is pending as usual.
 
 ## Interactive scripts
 

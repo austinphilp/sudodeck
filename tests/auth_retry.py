@@ -106,9 +106,10 @@ class AuthRetryTests(unittest.TestCase):
         self.assertEqual(self.detect(web_login)["login_command"], "gcloud auth login")
 
     def test_refresh_errors_without_a_named_command_suggest_both_logins(self):
-        for text in ("google.auth.exceptions.RefreshError: ('invalid_grant: Token has been expired or revoked.', {})",
-                     'oauth2: "invalid_grant" "Token has been expired or revoked."',
-                     "RefreshError: ('invalid_grant: reauth related error (invalid_rapt)', {})",
+        for text in ("ERROR: (bq) There was a problem refreshing your current auth tokens: "
+                     "('invalid_grant: Token has been expired or revoked.', {'error': 'invalid_grant'})",
+                     "ERROR: (gcloud.storage.ls) There was a problem refreshing auth tokens for account a@b.io: "
+                     "('invalid_grant: reauth related error (invalid_rapt)', {})",
                      "Reauthentication failed. cannot prompt during non-interactive execution."):
             with self.subTest(text=text):
                 detected = self.detect(text)
@@ -125,12 +126,15 @@ class AuthRetryTests(unittest.TestCase):
                      "You do not currently have an active account selected." + advice,
                      "There was a problem refreshing your current auth tokens: denied by context aware access policy",
                      "Reauthentication required.",
+                     # Other Google OAuth clients, such as a stored Ads refresh token.
+                     "google.auth.exceptions.RefreshError: ('invalid_grant: Token has been expired or revoked.', {})",
+                     'oauth2: "invalid_grant" "Token has been expired or revoked."',
                      "ERROR: permission denied; try gcloud auth login"):
             with self.subTest(text=text):
                 self.assertIsNone(self.detect(text))
 
     def test_retry_note_applies_only_to_the_current_pending_revision(self):
-        item = self.enqueue("bq stale", f"cat >&2 <<'EOF'\n{BQ_STDERR}EOF\nexit 1\n")
+        item = self.enqueue("bq stale on stdout", f"cat <<'EOF'\n{BQ_STDERR}EOF\nexit 1\n")
         failed, _ = self.run_item(item["id"])
         self.assertEqual(failed["runs"][-1]["gcloud_reauth_required"]["sha256"], failed["sha256"])
         with contextlib.redirect_stdout(io.StringIO()) as listed:

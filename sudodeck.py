@@ -46,7 +46,7 @@ DEFAULT_ACTIONS = {"none", "run", "edit", "ask", "deny", "quit"}
 # google/oauth2/reauth.py, google/oauth2/challenges.py). A failed run whose output
 # matches one stays pending so the owner can log in and run it again.
 # gcloud appends "Please run: $ gcloud auth login ... to obtain new credentials." to
-# every token refresh failure, including transient and permission errors, so that
+# most token refresh failures, including transient and permission errors, so that
 # advice only names the login command; it never marks a failure as re-auth by itself.
 GCLOUD_REAUTH_SIGNATURES = tuple(re.compile(pattern) for pattern in (
     r"There was a problem reauthenticating while refreshing",
@@ -54,7 +54,9 @@ GCLOUD_REAUTH_SIGNATURES = tuple(re.compile(pattern) for pattern in (
     r"Reauthentication is needed\. Please run `gcloud auth application-default login` to reauthenticate",
     r"Please run `gcloud auth login` to complete reauthentication with SAML",
     r"Reauthentication failed\. cannot prompt during non-interactive execution",
-    # google-auth RefreshError "invalid_grant: <Google error_description>".
+    # Google OAuth "invalid_grant" descriptions, only as reported by gcloud or bq. Any
+    # Google client (for example a stored Ads refresh token) can print them bare.
+    r"There was a problem refreshing (?:your current auth tokens|auth tokens for account \S+):[^\n]*"
     r"invalid_grant\W+(?:Token has been expired or revoked|reauth related error \(invalid_rapt\))",
 ))
 GCLOUD_LOGIN_COMMAND = re.compile(
