@@ -45,16 +45,21 @@ DEFAULT_ACTIONS = {"none", "run", "edit", "ask", "deny", "quit"}
 # exceptions.py) and its vendored google-auth (google/auth/exceptions.py,
 # google/oauth2/reauth.py, google/oauth2/challenges.py). A failed run whose output
 # matches one stays pending so the owner can log in and run it again.
-# Group 1, when present, is the login command the message names.
+# gcloud appends "Please run: $ gcloud auth login ... to obtain new credentials." to
+# every token refresh failure, including transient and permission errors, so that
+# advice only names the login command; it never marks a failure as re-auth by itself.
 GCLOUD_REAUTH_SIGNATURES = tuple(re.compile(pattern) for pattern in (
-    # gcloud/bq "Please run:\n\n  $ gcloud auth login\n\nto obtain new credentials."
-    r"\$ (gcloud auth (?:application-default )?login)\s+to (?:obtain new credentials|complete reauthentication)",
-    r"Reauthentication is needed\. Please run `(gcloud auth application-default login)` to reauthenticate",
-    r"Please run `(gcloud auth login)` to complete reauthentication with SAML",
+    r"There was a problem reauthenticating while refreshing",
+    r"\$ gcloud auth (?:application-default )?login\s+to complete reauthentication",
+    r"Reauthentication is needed\. Please run `gcloud auth application-default login` to reauthenticate",
+    r"Please run `gcloud auth login` to complete reauthentication with SAML",
     r"Reauthentication failed\. cannot prompt during non-interactive execution",
     # google-auth RefreshError "invalid_grant: <Google error_description>".
     r"invalid_grant\W+(?:Token has been expired or revoked|reauth related error \(invalid_rapt\))",
 ))
+GCLOUD_LOGIN_COMMAND = re.compile(
+    r"\$ (gcloud auth (?:application-default )?login)\s+to (?:obtain new credentials|complete reauthentication)"
+    r"|`(gcloud auth (?:application-default )?login)` to (?:reauthenticate|complete reauthentication)")
 REAUTH_SCAN_BYTES = 64 * 1024
 
 
@@ -270,7 +275,9 @@ def reauth_retry(record: dict | None) -> dict | None:
 def pending_reauth(item: dict) -> dict | None:
     """Return the re-auth note when the current revision's last run failed on gcloud auth."""
     record = latest_execution(item)
-    return reauth_retry(record) if record and record.get("sha256") == item.get("sha256") else None
+    if is_denied(item) or not record or record.get("sha256") != item.get("sha256"):
+        return None
+    return reauth_retry(record)
 
 
 def is_completed(item: dict) -> bool:
@@ -306,7 +313,7 @@ def reauth_hint(command: str | None) -> str:
 
 def detect_gcloud_reauth(logs: tuple[pathlib.Path, ...]) -> dict | None:
     """Match only known gcloud/google-auth re-auth messages near the end of a run's logs."""
-    matched, command = False, None
+    texts = []
     for log in logs:
         try:
             with log.open("rb") as handle:
@@ -314,12 +321,12 @@ def detect_gcloud_reauth(logs: tuple[pathlib.Path, ...]) -> dict | None:
                 text = handle.read().decode("utf-8", errors="replace")
         except OSError:
             continue
-        for signature in GCLOUD_REAUTH_SIGNATURES:
-            found = signature.search(text)
-            if found:
-                matched = True
-                command = command or (found.group(1) if signature.groups else None)
-    return {"login_command": command, "hint": reauth_hint(command)} if matched else None
+        texts.append(text)
+    if not any(signature.search(text) for text in texts for signature in GCLOUD_REAUTH_SIGNATURES):
+        return None
+    named = next((found for text in texts if (found := GCLOUD_LOGIN_COMMAND.search(text))), None)
+    command = (named.group(1) or named.group(2)) if named else None
+    return {"login_command": command, "hint": reauth_hint(command)}
 
 
 def verify(item: dict) -> pathlib.Path:
@@ -856,6 +863,8 @@ def run(item: dict) -> None:
             record.update({"ended_at": now(), "status": "failed", "reason": str(exc)})
         reauth = detect_gcloud_reauth((stderr, stdout)) if record["status"] == "failed" and record["exit_code"] else None
         if reauth:
+            # Names the revision so JSON readers can tell whether it still applies.
+            reauth["sha256"] = record["sha256"]
             record["gcloud_reauth_required"] = reauth
         atomic_json(run_dir / "result.json", record)
     summary = {"run_id": run_id, "started_at": record["started_at"], "status": record["status"], "exit_code": record["exit_code"]}

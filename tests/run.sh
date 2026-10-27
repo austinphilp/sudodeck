@@ -133,7 +133,7 @@ grep -q 'payload changed for' "$work/tamper.err"
 python3 tests/qa_adapters.py
 python3 tests/edit_review.py
 python3 tests/presentation.py
-python3 tests/interactive.py
 python3 tests/auth_retry.py
+python3 tests/interactive.py
 
 echo 'SudoDeck tests passed'

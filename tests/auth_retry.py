@@ -93,15 +93,17 @@ class AuthRetryTests(unittest.TestCase):
         self.assertTrue(self.module["is_completed"](ran))
 
     def test_named_login_commands(self):
-        adc = "$ gcloud auth application-default login\n\nto obtain new credentials."
-        self.assertEqual(self.detect(adc)["login_command"], "gcloud auth application-default login")
+        adc_reauth = ("There was a problem reauthenticating while refreshing your current auth tokens: reauth is required.\n"
+                      "Please retry your command or run:\n\n  $ gcloud auth application-default login\n\n"
+                      "to obtain new credentials.")
+        self.assertEqual(self.detect(adc_reauth)["login_command"], "gcloud auth application-default login")
         google_auth = ("google.auth.exceptions.RefreshError: Reauthentication is needed. Please run "
                        "`gcloud auth application-default login` to reauthenticate.")
         self.assertEqual(self.detect(google_auth)["login_command"], "gcloud auth application-default login")
         saml = "Please run `gcloud auth login` to complete reauthentication with SAML."
         self.assertEqual(self.detect(saml)["login_command"], "gcloud auth login")
-        retry = "Please retry your command or run:\n\n  $ gcloud auth login\n\nto obtain new credentials."
-        self.assertEqual(self.detect(retry)["login_command"], "gcloud auth login")
+        web_login = "Please run:\n\n  $ gcloud auth login\n\nto complete reauthentication."
+        self.assertEqual(self.detect(web_login)["login_command"], "gcloud auth login")
 
     def test_refresh_errors_without_a_named_command_suggest_both_logins(self):
         for text in ("google.auth.exceptions.RefreshError: ('invalid_grant: Token has been expired or revoked.', {})",
@@ -113,16 +115,34 @@ class AuthRetryTests(unittest.TestCase):
                 self.assertIsNone(detected["login_command"])
                 self.assertIn("`gcloud auth login` (or `gcloud auth application-default login`", detected["hint"])
 
-    def test_near_misses_are_not_reauth_failures(self):
-        for text in ("There was a problem refreshing your current auth tokens: denied by context aware access policy",
-                     "invalid_grant: Bad Request",
-                     "invalid_grant: Invalid JWT: Token must be a short-lived token (60 minutes) and in a reasonable timeframe.",
+    def test_other_gcloud_auth_failures_are_not_reauth_failures(self):
+        # gcloud appends the same login advice to every token refresh failure.
+        advice = "\nPlease run:\n\n  $ gcloud auth login\n\nto obtain new credentials."
+        for text in ("There was a problem refreshing your current auth tokens: temporarily_unavailable: try later" + advice,
+                     "There was a problem refreshing your current auth tokens: invalid_grant: Bad Request" + advice,
+                     "There was a problem refreshing your current auth tokens: invalid_grant: Invalid JWT: Token must be "
+                     "a short-lived token (60 minutes) and in a reasonable timeframe." + advice,
+                     "You do not currently have an active account selected." + advice,
+                     "There was a problem refreshing your current auth tokens: denied by context aware access policy",
                      "Reauthentication required.",
-                     "$ gcloud auth login --cred-file=SERVICE_ACCOUNT_FILE_PATH\n\nto obtain new credentials.",
                      "ERROR: permission denied; try gcloud auth login"):
             with self.subTest(text=text):
                 self.assertIsNone(self.detect(text))
 
+    def test_retry_note_applies_only_to_the_current_pending_revision(self):
+        item = self.enqueue("bq stale", f"cat >&2 <<'EOF'\n{BQ_STDERR}EOF\nexit 1\n")
+        failed, _ = self.run_item(item["id"])
+        self.assertEqual(failed["runs"][-1]["gcloud_reauth_required"]["sha256"], failed["sha256"])
+        with contextlib.redirect_stdout(io.StringIO()) as listed:
+            self.module["list_items"](argparse.Namespace(include_ran=False, include_denied=False, json=False,
+                                                         show_sha256=False))
+        self.assertIn("Run `gcloud auth login`", " ".join(listed.getvalue().split()))
+
+        revised = dict(failed, sha256="0" * 64)
+        self.assertTrue(self.module["execution_label"](revised).startswith("PENDING REVISION (last FAILED"))
+        self.assertNotIn("Last attempt", self.module["describe"](revised))
+        denied = dict(failed, denials=[{"denial_id": "d", "denied_at": "x", "sha256": failed["sha256"], "reason": ""}])
+        self.assertNotIn("Last attempt", self.module["describe"](denied))
 
 if __name__ == "__main__":
     unittest.main()
